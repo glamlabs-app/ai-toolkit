@@ -3,7 +3,9 @@ from einops import rearrange
 from torch import Tensor, nn
 import torch.utils.checkpoint as ckpt
 import math
+import os
 from dataclasses import dataclass, field
+from typing import Optional
 
 
 @dataclass
@@ -52,6 +54,153 @@ class FakeConfig:
     # for diffusers compatability
     def __init__(self):
         self.patch_size = 1
+
+
+def _set_module_by_name(root: nn.Module, module_name: str, new_module: nn.Module):
+    if "." in module_name:
+        parent_name, leaf_name = module_name.rsplit(".", 1)
+        parent = root.get_submodule(parent_name)
+    else:
+        parent = root
+        leaf_name = module_name
+    setattr(parent, leaf_name, new_module)
+
+
+class FP8ScaledLinear(nn.Module):
+    """Linear layer backed by FP8 weights + per-layer scales."""
+
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        weight_fp8: Tensor,
+        weight_scale: Tensor,
+        input_scale: Optional[Tensor] = None,
+        bias: Optional[Tensor] = None,
+    ):
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.register_buffer("weight_fp8", weight_fp8, persistent=False)
+        self.register_buffer("weight_scale", weight_scale.float(), persistent=False)
+        if input_scale is not None:
+            self.register_buffer("input_scale", input_scale.float(), persistent=False)
+        else:
+            self.input_scale = None
+        if bias is not None:
+            self.register_buffer("bias", bias, persistent=False)
+        else:
+            self.bias = None
+        self._logged_once = False
+
+    def _run_scaled_mm(
+        self,
+        a_fp8: Tensor,
+        b_fp8_t: Tensor,
+        scale_a: Tensor,
+        scale_b: Tensor,
+        out_dtype: torch.dtype,
+    ) -> Tensor:
+        if not hasattr(torch, "_scaled_mm"):
+            raise RuntimeError(
+                "Native FP8 inference requested, but torch._scaled_mm is unavailable."
+            )
+
+        # Torch versions differ in _scaled_mm signature/return type.
+        try:
+            out = torch._scaled_mm(
+                a_fp8,
+                b_fp8_t,
+                scale_a=scale_a,
+                scale_b=scale_b,
+                out_dtype=out_dtype,
+            )
+        except TypeError:
+            out = torch._scaled_mm(a_fp8, b_fp8_t, scale_a, scale_b, out_dtype)
+
+        if isinstance(out, tuple):
+            out = out[0]
+        return out
+
+    def forward(self, x: Tensor) -> Tensor:
+        if not x.is_cuda:
+            raise RuntimeError(
+                "Native FP8 inference requires CUDA tensors for FP8 linear layers."
+            )
+        if self.weight_fp8.dtype not in (torch.float8_e4m3fn, torch.float8_e5m2):
+            raise RuntimeError(
+                f"Expected FP8 weight dtype, got {self.weight_fp8.dtype}."
+            )
+
+        x2d = x.reshape(-1, x.shape[-1]).contiguous()
+        out_dtype = x.dtype
+        weight_scale = self.weight_scale.to(device=x.device)
+
+        if self.input_scale is not None:
+            scale_a = self.input_scale.to(device=x.device)
+        else:
+            # Conservative runtime-derived activation scale when not present.
+            max_abs = x2d.abs().amax()
+            scale_a = (max_abs / 448.0).clamp(min=1e-8).to(torch.float32)
+
+        x_fp8 = (x2d / scale_a).to(torch.float8_e4m3fn)
+        # torch._scaled_mm expects mat2 in col-major layout for best kernel coverage.
+        # A plain transpose gives the expected col-major stride pattern.
+        w_fp8_t = self.weight_fp8.t()
+        if os.getenv("FP8_VERBOSE", "0") == "1" and not self._logged_once:
+            print(
+                f"[FP8ScaledLinear] scaled_mm x={tuple(x2d.shape)} w={tuple(self.weight_fp8.shape)} "
+                f"scale_a={float(scale_a)} scale_b={float(weight_scale)}"
+            )
+            self._logged_once = True
+        out2d = self._run_scaled_mm(
+            x_fp8,
+            w_fp8_t,
+            scale_a.to(torch.float32),
+            weight_scale.to(torch.float32),
+            out_dtype=out_dtype,
+        )
+        if self.bias is not None:
+            out2d = out2d + self.bias.to(device=out2d.device, dtype=out2d.dtype)
+        return out2d.view(*x.shape[:-1], self.out_features)
+
+
+def apply_fp8_checkpoint_to_linears(
+    model: nn.Module,
+    checkpoint_state_dict: dict[str, Tensor],
+) -> int:
+    """Replace matching nn.Linear modules with FP8ScaledLinear wrappers."""
+    replaced = 0
+    named_modules = list(model.named_modules())
+    for module_name, module in named_modules:
+        if not isinstance(module, nn.Linear):
+            continue
+        weight_key = f"{module_name}.weight"
+        if weight_key not in checkpoint_state_dict:
+            continue
+        weight_fp8 = checkpoint_state_dict[weight_key]
+        if weight_fp8.dtype not in (torch.float8_e4m3fn, torch.float8_e5m2):
+            continue
+
+        weight_scale = checkpoint_state_dict.get(f"{module_name}.weight_scale", None)
+        if weight_scale is None:
+            raise RuntimeError(
+                f"Native FP8 checkpoint missing required weight scale for {module_name}."
+            )
+        input_scale = checkpoint_state_dict.get(f"{module_name}.input_scale", None)
+        bias = module.bias.detach().to("cpu") if module.bias is not None else None
+
+        fp8_module = FP8ScaledLinear(
+            in_features=module.in_features,
+            out_features=module.out_features,
+            weight_fp8=weight_fp8.to("cpu"),
+            weight_scale=weight_scale.to("cpu"),
+            input_scale=input_scale.to("cpu") if input_scale is not None else None,
+            bias=bias,
+        )
+        _set_module_by_name(model, module_name, fp8_module)
+        replaced += 1
+    return replaced
 
 
 class Flux2(nn.Module):

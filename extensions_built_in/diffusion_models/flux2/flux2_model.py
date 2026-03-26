@@ -19,7 +19,7 @@ from optimum.quanto import freeze, QTensor
 from toolkit.util.quantize import quantize, get_qtype, quantize_model
 
 from transformers import AutoProcessor, Mistral3ForConditionalGeneration
-from .src.model import Flux2, Flux2Params
+from .src.model import Flux2, Flux2Params, apply_fp8_checkpoint_to_linears
 from .src.pipeline import Flux2Pipeline
 from .src.autoencoder import AutoEncoder, AutoEncoderParams
 from safetensors.torch import load_file, save_file
@@ -148,14 +148,58 @@ class Flux2Model(BaseModel):
             )
 
         transformer_state_dict = load_file(transformer_path, device="cpu")
+        fp8_native_inference = bool(
+            self.model_config.model_kwargs.get("fp8_native_inference", False)
+            or getattr(self.model_config, "fp8_native_inference", False)
+        )
+        has_fp8_weights = any(
+            v.dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
+            for v in transformer_state_dict.values()
+        )
 
-        # cast to dtype
-        for key in transformer_state_dict:
-            transformer_state_dict[key] = transformer_state_dict[key].to(dtype)
+        if fp8_native_inference:
+            if not has_fp8_weights:
+                raise RuntimeError(
+                    "fp8_native_inference=True but checkpoint has no FP8 weight tensors."
+                )
+            if self.model_config.quantize:
+                raise RuntimeError(
+                    "fp8_native_inference is incompatible with quantize=True; disable runtime quantization for native FP8 checkpoints."
+                )
+            if not hasattr(torch, "_scaled_mm"):
+                raise RuntimeError(
+                    "Native FP8 inference requested but this torch build has no torch._scaled_mm."
+                )
 
-        transformer.load_state_dict(transformer_state_dict, assign=True)
+        if fp8_native_inference:
+            replaced = apply_fp8_checkpoint_to_linears(transformer, transformer_state_dict)
+            self.print_and_status_update(
+                f"Installed native FP8 wrappers for {replaced} linear layers"
+            )
 
-        transformer.to(self.quantize_device, dtype=dtype)
+        # Build load dict for regular parameters only.
+        load_state_dict = {}
+        for key, value in transformer_state_dict.items():
+            if key.endswith("input_scale") or key.endswith("weight_scale"):
+                continue
+            if value.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+                continue
+            load_state_dict[key] = value.to(dtype)
+
+        load_result = transformer.load_state_dict(
+            load_state_dict,
+            strict=not fp8_native_inference,
+            assign=True,
+        )
+        if fp8_native_inference and len(load_result.unexpected_keys) > 0:
+            raise RuntimeError(
+                f"Unexpected keys while loading FP8 model: {load_result.unexpected_keys[:10]}"
+            )
+
+        if fp8_native_inference:
+            transformer.to(self.quantize_device)
+        else:
+            transformer.to(self.quantize_device, dtype=dtype)
 
         if self.model_config.quantize:
             # patch the state dict method
@@ -234,7 +278,8 @@ class Flux2Model(BaseModel):
 
         flush()
         # just to make sure everything is on the right device and dtype
-        text_encoder[0].to(self.device_torch)
+        te_device = self.model_config.te_device or self.device_torch
+        text_encoder[0].to(te_device)
         text_encoder[0].requires_grad_(False)
         text_encoder[0].eval()
         pipe.transformer = pipe.transformer.to(self.device_torch)
@@ -250,6 +295,7 @@ class Flux2Model(BaseModel):
 
     def get_generation_pipeline(self):
         scheduler = Flux2Model.get_train_scheduler()
+        te_device = self.model_config.te_device or self.device_torch
 
         pipeline: Flux2Pipeline = Flux2Pipeline(
             scheduler=scheduler,
@@ -261,7 +307,10 @@ class Flux2Model(BaseModel):
             is_guidance_distilled=self.flux2_is_guidance_distilled,
         )
 
-        pipeline = pipeline.to(self.device_torch)
+        # Keep heavy denoiser on target GPU while optionally keeping text encoder on CPU.
+        pipeline.vae.to(self.device_torch)
+        pipeline.transformer.to(self.device_torch)
+        pipeline.text_encoder.to(te_device)
 
         return pipeline
 
@@ -444,13 +493,14 @@ class Flux2Model(BaseModel):
         return noise_pred
 
     def get_prompt_embeds(self, prompt: str) -> PromptEmbeds:
-        if self.pipeline.text_encoder.device != self.device_torch:
-            self.pipeline.text_encoder.to(self.device_torch)
+        te_device = self.model_config.te_device or self.device_torch
+        if self.pipeline.text_encoder.device != te_device:
+            self.pipeline.text_encoder.to(te_device)
 
         prompt_embeds, prompt_embeds_mask = self.pipeline.encode_prompt(
-            prompt, device=self.device_torch
+            prompt, device=te_device
         )
-        pe = PromptEmbeds(prompt_embeds)
+        pe = PromptEmbeds(prompt_embeds.to(self.device_torch))
         return pe
 
     def get_model_has_grad(self):

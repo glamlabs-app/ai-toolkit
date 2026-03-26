@@ -508,10 +508,13 @@ class AiToolkitDataset(LatentCachingMixin, ControlCachingMixin, CLIPCachingMixin
             
         temporal_compression = 8
         if self.sd is not None:
-            if hasattr(self.sd.vae.config, 'scale_factor_temporal'):
-                temporal_compression = self.sd.vae.config.scale_factor_temporal
-            if hasattr(self.sd.unet.config, 'temporal_compression_ratio'):
-                temporal_compression = self.sd.unet.config.temporal_compression_ratio
+            # Some VAE wrappers (e.g. Flux2 AutoEncoder) may not expose a `.config` object.
+            vae_cfg = getattr(self.sd.vae, "config", None)
+            if vae_cfg is not None and hasattr(vae_cfg, "scale_factor_temporal"):
+                temporal_compression = vae_cfg.scale_factor_temporal
+            unet_cfg = getattr(self.sd.unet, "config", None)
+            if unet_cfg is not None and hasattr(unet_cfg, "temporal_compression_ratio"):
+                temporal_compression = unet_cfg.temporal_compression_ratio
         
         bad_count = 0
         for file in tqdm(file_list):
