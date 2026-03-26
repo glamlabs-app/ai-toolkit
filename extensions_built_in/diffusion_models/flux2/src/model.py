@@ -66,8 +66,82 @@ def _set_module_by_name(root: nn.Module, module_name: str, new_module: nn.Module
     setattr(parent, leaf_name, new_module)
 
 
+def _run_scaled_mm(
+    a_fp8: Tensor,
+    b_fp8_t: Tensor,
+    scale_a: Tensor,
+    scale_b: Tensor,
+    out_dtype: torch.dtype,
+) -> Tensor:
+    if not hasattr(torch, "_scaled_mm"):
+        raise RuntimeError(
+            "Native FP8 path requested, but torch._scaled_mm is unavailable."
+        )
+    try:
+        out = torch._scaled_mm(
+            a_fp8,
+            b_fp8_t,
+            scale_a=scale_a,
+            scale_b=scale_b,
+            out_dtype=out_dtype,
+        )
+    except TypeError:
+        out = torch._scaled_mm(a_fp8, b_fp8_t, scale_a, scale_b, out_dtype)
+    if isinstance(out, tuple):
+        out = out[0]
+    return out
+
+
+class _FP8LinearFn(torch.autograd.Function):
+    """FP8 scaled matmul with custom backward for LoRA training.
+
+    Forward:  FP8 _scaled_mm  (fast tensor-core path)
+    Backward: dequant weight to BF16, compute grad_x = grad_output @ weight_bf16
+              (no grad_weight -- base is frozen)
+    """
+
+    @staticmethod
+    def forward(
+        ctx,
+        x_2d: Tensor,
+        weight_fp8: Tensor,
+        weight_scale: Tensor,
+        input_scale: Optional[Tensor],
+    ) -> Tensor:
+        out_dtype = x_2d.dtype
+        w_scale = weight_scale.to(device=x_2d.device, dtype=torch.float32)
+
+        if input_scale is not None:
+            s_a = input_scale.to(device=x_2d.device, dtype=torch.float32)
+        else:
+            max_abs = x_2d.detach().abs().amax()
+            s_a = (max_abs / 448.0).clamp(min=1e-8).to(torch.float32)
+
+        # Clamp to FP8 e4m3fn representable range before cast
+        x_scaled = (x_2d / s_a).clamp(-448.0, 448.0)
+        x_fp8 = x_scaled.to(torch.float8_e4m3fn)
+        w_fp8_t = weight_fp8.t()
+
+        out = _run_scaled_mm(x_fp8, w_fp8_t, s_a, w_scale, out_dtype)
+
+        ctx.save_for_backward(weight_fp8, w_scale)
+        ctx.out_dtype = out_dtype
+        return out
+
+    @staticmethod
+    def backward(ctx, grad_output: Tensor):
+        weight_fp8, w_scale = ctx.saved_tensors
+        weight_bf16 = weight_fp8.to(grad_output.dtype) * w_scale
+        grad_x = grad_output @ weight_bf16
+        return grad_x, None, None, None
+
+
 class FP8ScaledLinear(nn.Module):
-    """Linear layer backed by FP8 weights + per-layer scales."""
+    """Linear layer backed by FP8 weights + per-layer scales.
+
+    Supports both inference (eager _scaled_mm) and training (custom autograd
+    backward that dequantizes weight for grad_x computation).
+    """
 
     def __init__(
         self,
@@ -93,76 +167,51 @@ class FP8ScaledLinear(nn.Module):
             self.bias = None
         self._logged_once = False
 
-    def _run_scaled_mm(
-        self,
-        a_fp8: Tensor,
-        b_fp8_t: Tensor,
-        scale_a: Tensor,
-        scale_b: Tensor,
-        out_dtype: torch.dtype,
-    ) -> Tensor:
-        if not hasattr(torch, "_scaled_mm"):
-            raise RuntimeError(
-                "Native FP8 inference requested, but torch._scaled_mm is unavailable."
-            )
-
-        # Torch versions differ in _scaled_mm signature/return type.
-        try:
-            out = torch._scaled_mm(
-                a_fp8,
-                b_fp8_t,
-                scale_a=scale_a,
-                scale_b=scale_b,
-                out_dtype=out_dtype,
-            )
-        except TypeError:
-            out = torch._scaled_mm(a_fp8, b_fp8_t, scale_a, scale_b, out_dtype)
-
-        if isinstance(out, tuple):
-            out = out[0]
-        return out
-
     def forward(self, x: Tensor) -> Tensor:
         if not x.is_cuda:
             raise RuntimeError(
-                "Native FP8 inference requires CUDA tensors for FP8 linear layers."
-            )
-        if self.weight_fp8.dtype not in (torch.float8_e4m3fn, torch.float8_e5m2):
-            raise RuntimeError(
-                f"Expected FP8 weight dtype, got {self.weight_fp8.dtype}."
+                "FP8ScaledLinear requires CUDA tensors."
             )
 
+        leading_shape = x.shape[:-1]
         x2d = x.reshape(-1, x.shape[-1]).contiguous()
         out_dtype = x.dtype
         weight_scale = self.weight_scale.to(device=x.device)
 
-        if self.input_scale is not None:
-            scale_a = self.input_scale.to(device=x.device)
-        else:
-            # Conservative runtime-derived activation scale when not present.
-            max_abs = x2d.abs().amax()
-            scale_a = (max_abs / 448.0).clamp(min=1e-8).to(torch.float32)
-
-        x_fp8 = (x2d / scale_a).to(torch.float8_e4m3fn)
-        # torch._scaled_mm expects mat2 in col-major layout for best kernel coverage.
-        # A plain transpose gives the expected col-major stride pattern.
-        w_fp8_t = self.weight_fp8.t()
-        if os.getenv("FP8_VERBOSE", "0") == "1" and not self._logged_once:
-            print(
-                f"[FP8ScaledLinear] scaled_mm x={tuple(x2d.shape)} w={tuple(self.weight_fp8.shape)} "
-                f"scale_a={float(scale_a)} scale_b={float(weight_scale)}"
+        if torch.is_grad_enabled() and x.requires_grad:
+            out2d = _FP8LinearFn.apply(
+                x2d,
+                self.weight_fp8,
+                weight_scale,
+                self.input_scale,
             )
-            self._logged_once = True
-        out2d = self._run_scaled_mm(
-            x_fp8,
-            w_fp8_t,
-            scale_a.to(torch.float32),
-            weight_scale.to(torch.float32),
-            out_dtype=out_dtype,
-        )
+        else:
+            if self.input_scale is not None:
+                scale_a = self.input_scale.to(device=x.device)
+            else:
+                max_abs = x2d.abs().amax()
+                scale_a = (max_abs / 448.0).clamp(min=1e-8).to(torch.float32)
+
+            x_fp8 = (x2d / scale_a).clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
+            w_fp8_t = self.weight_fp8.t()
+
+            if os.getenv("FP8_VERBOSE", "0") == "1" and not self._logged_once:
+                print(
+                    f"[FP8ScaledLinear] scaled_mm x={tuple(x2d.shape)} w={tuple(self.weight_fp8.shape)} "
+                    f"scale_a={float(scale_a)} scale_b={float(weight_scale)}"
+                )
+                self._logged_once = True
+
+            out2d = _run_scaled_mm(
+                x_fp8, w_fp8_t,
+                scale_a.to(torch.float32),
+                weight_scale.to(torch.float32),
+                out_dtype=out_dtype,
+            )
+
         if self.bias is not None:
             out2d = out2d + self.bias.to(device=out2d.device, dtype=out2d.dtype)
-        return out2d.view(*x.shape[:-1], self.out_features)
+        return out2d.view(*leading_shape, self.out_features)
 
 
 def apply_fp8_checkpoint_to_linears(

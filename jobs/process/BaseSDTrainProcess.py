@@ -1717,7 +1717,11 @@ class BaseSDTrainProcess(BaseTrainProcess):
         else:
             text_encoder.requires_grad_(False)
             text_encoder.eval()
-        unet.to(self.device_torch, dtype=dtype)
+        _fp8_native = getattr(self.sd.model_config, 'fp8_native_training', False) or getattr(self.sd.model_config, 'fp8_native_inference', False)
+        if _fp8_native:
+            unet.to(self.device_torch)
+        else:
+            unet.to(self.device_torch, dtype=dtype)
         unet.requires_grad_(False)
         unet.eval()
         vae = vae.to(torch.device('cpu'), dtype=dtype)

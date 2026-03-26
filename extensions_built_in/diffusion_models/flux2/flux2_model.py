@@ -135,8 +135,21 @@ class Flux2Model(BaseModel):
         with torch.device("meta"):
             transformer = Flux2(self.get_flux2_params())
 
-        # use local path if provided
-        if os.path.exists(os.path.join(transformer_path, self.flux2_te_filename)):
+        use_fp8_native = bool(
+            self.model_config.model_kwargs.get("fp8_native_inference", False)
+            or getattr(self.model_config, "fp8_native_inference", False)
+            or self.model_config.model_kwargs.get("fp8_native_training", False)
+            or getattr(self.model_config, "fp8_native_training", False)
+        )
+
+        # use local path if provided — prefer FP8 checkpoint files when native FP8 is enabled
+        if use_fp8_native and os.path.isdir(transformer_path):
+            import glob
+            fp8_candidates = sorted(glob.glob(os.path.join(transformer_path, "*fp8*.safetensors")))
+            if fp8_candidates:
+                transformer_path = fp8_candidates[0]
+                self.print_and_status_update(f"Using FP8 checkpoint: {os.path.basename(transformer_path)}")
+        if os.path.isdir(transformer_path) and os.path.exists(os.path.join(transformer_path, self.flux2_te_filename)):
             transformer_path = os.path.join(transformer_path, self.flux2_te_filename)
 
         if not os.path.exists(transformer_path):
@@ -148,30 +161,26 @@ class Flux2Model(BaseModel):
             )
 
         transformer_state_dict = load_file(transformer_path, device="cpu")
-        fp8_native_inference = bool(
-            self.model_config.model_kwargs.get("fp8_native_inference", False)
-            or getattr(self.model_config, "fp8_native_inference", False)
-        )
         has_fp8_weights = any(
             v.dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
             for v in transformer_state_dict.values()
         )
 
-        if fp8_native_inference:
+        if use_fp8_native:
             if not has_fp8_weights:
                 raise RuntimeError(
-                    "fp8_native_inference=True but checkpoint has no FP8 weight tensors."
+                    "FP8 native mode enabled but checkpoint has no FP8 weight tensors."
                 )
             if self.model_config.quantize:
                 raise RuntimeError(
-                    "fp8_native_inference is incompatible with quantize=True; disable runtime quantization for native FP8 checkpoints."
+                    "FP8 native mode is incompatible with quantize=True; disable runtime quantization for native FP8 checkpoints."
                 )
             if not hasattr(torch, "_scaled_mm"):
                 raise RuntimeError(
-                    "Native FP8 inference requested but this torch build has no torch._scaled_mm."
+                    "FP8 native mode requested but this torch build has no torch._scaled_mm."
                 )
 
-        if fp8_native_inference:
+        if use_fp8_native:
             replaced = apply_fp8_checkpoint_to_linears(transformer, transformer_state_dict)
             self.print_and_status_update(
                 f"Installed native FP8 wrappers for {replaced} linear layers"
@@ -188,16 +197,16 @@ class Flux2Model(BaseModel):
 
         load_result = transformer.load_state_dict(
             load_state_dict,
-            strict=not fp8_native_inference,
+            strict=not use_fp8_native,
             assign=True,
         )
-        if fp8_native_inference and len(load_result.unexpected_keys) > 0:
+        if use_fp8_native and len(load_result.unexpected_keys) > 0:
             raise RuntimeError(
                 f"Unexpected keys while loading FP8 model: {load_result.unexpected_keys[:10]}"
             )
 
-        if fp8_native_inference:
-            transformer.to(self.quantize_device)
+        if use_fp8_native:
+            transformer.to(self.device_torch)
         else:
             transformer.to(self.quantize_device, dtype=dtype)
 
@@ -207,7 +216,7 @@ class Flux2Model(BaseModel):
             self.print_and_status_update("Quantizing Transformer")
             quantize_model(self, transformer)
             flush()
-        else:
+        elif not use_fp8_native:
             transformer.to(self.device_torch, dtype=dtype)
         flush()
 

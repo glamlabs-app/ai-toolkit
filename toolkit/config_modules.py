@@ -636,8 +636,9 @@ class ModelConfig:
         self.quantize_te = kwargs.get("quantize_te", self.quantize)
         self.qtype = kwargs.get("qtype", "qfloat8")
         self.qtype_te = kwargs.get("qtype_te", "qfloat8")
-        # Native FP8 execution path for FP8 checkpoints (inference use).
+        # Native FP8 execution path for FP8 checkpoints (inference and/or training).
         self.fp8_native_inference = kwargs.get("fp8_native_inference", False)
+        self.fp8_native_training = kwargs.get("fp8_native_training", False)
         self.low_vram = kwargs.get("low_vram", False)
         self.attn_masking = kwargs.get("attn_masking", False)
         if self.attn_masking and not self.is_flux:
