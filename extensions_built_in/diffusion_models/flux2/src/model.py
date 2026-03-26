@@ -92,11 +92,15 @@ def _run_scaled_mm(
     return out
 
 
+_FP8_E5M2_MAX = 57344.0
+
+
 class _FP8LinearFn(torch.autograd.Function):
-    """FP8 scaled matmul with custom backward for LoRA training.
+    """FP8 scaled matmul with FP8 backward for LoRA training.
 
     Forward:  FP8 _scaled_mm  (fast tensor-core path)
-    Backward: dequant weight to BF16, compute grad_x = grad_output @ weight_bf16
+    Backward: quantize grad_output to FP8 e5m2, compute
+              grad_x = grad_output_fp8 @ weight_fp8 via _scaled_mm
               (no grad_weight -- base is frozen)
     """
 
@@ -117,22 +121,35 @@ class _FP8LinearFn(torch.autograd.Function):
             max_abs = x_2d.detach().abs().amax()
             s_a = (max_abs / 448.0).clamp(min=1e-8).to(torch.float32)
 
-        # Clamp to FP8 e4m3fn representable range before cast
         x_scaled = (x_2d / s_a).clamp(-448.0, 448.0)
         x_fp8 = x_scaled.to(torch.float8_e4m3fn)
         w_fp8_t = weight_fp8.t()
 
         out = _run_scaled_mm(x_fp8, w_fp8_t, s_a, w_scale, out_dtype)
 
-        ctx.save_for_backward(weight_fp8, w_scale)
+        # Build column-major weight for backward _scaled_mm on the fly
+        # so we don't permanently double FP8 weight memory.
+        # weight_fp8 [N,K] row-major → .t().contiguous().t() → [N,K] column-major
+        w_col_major = weight_fp8.t().contiguous().t()
+        ctx.save_for_backward(w_col_major, w_scale)
         ctx.out_dtype = out_dtype
         return out
 
     @staticmethod
     def backward(ctx, grad_output: Tensor):
-        weight_fp8, w_scale = ctx.saved_tensors
-        weight_bf16 = weight_fp8.to(grad_output.dtype) * w_scale
-        grad_x = grad_output @ weight_bf16
+        w_col_major, w_scale = ctx.saved_tensors
+
+        grad = grad_output.contiguous()
+        max_abs = grad.detach().abs().amax()
+        grad_scale = (max_abs / _FP8_E5M2_MAX).clamp(min=1e-8).to(torch.float32)
+        grad_fp8 = (grad / grad_scale).clamp(-_FP8_E5M2_MAX, _FP8_E5M2_MAX).to(
+            torch.float8_e5m2
+        )
+
+        grad_x = _run_scaled_mm(
+            grad_fp8, w_col_major, grad_scale, w_scale, ctx.out_dtype
+        )
+
         return grad_x, None, None, None
 
 
@@ -140,7 +157,8 @@ class FP8ScaledLinear(nn.Module):
     """Linear layer backed by FP8 weights + per-layer scales.
 
     Supports both inference (eager _scaled_mm) and training (custom autograd
-    backward that dequantizes weight for grad_x computation).
+    backward that computes grad_x via FP8 _scaled_mm, keeping the full
+    forward+backward path in FP8 without dequantizing to BF16).
     """
 
     def __init__(
