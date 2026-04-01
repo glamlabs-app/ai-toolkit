@@ -188,15 +188,31 @@ class Flux2Model(BaseModel):
         if os.path.isdir(transformer_path) and os.path.exists(os.path.join(transformer_path, self.flux2_te_filename)):
             transformer_path = os.path.join(transformer_path, self.flux2_te_filename)
 
-        if not os.path.exists(transformer_path):
-            # assume it is from the hub
-            transformer_path = huggingface_hub.hf_hub_download(
-                repo_id=model_path,
-                filename=self.flux2_te_filename,
-                token=HF_TOKEN,
-            )
-
-        transformer_state_dict = load_file(transformer_path, device="cpu")
+        # Handle diffusers-format sharded weights (directory with index JSON)
+        if os.path.isdir(transformer_path):
+            _tdir = os.path.join(transformer_path, "transformer") if os.path.isdir(os.path.join(transformer_path, "transformer")) else transformer_path
+            _index = os.path.join(_tdir, "diffusion_pytorch_model.safetensors.index.json")
+            if os.path.exists(_index):
+                import json as _json
+                with open(_index) as _f:
+                    _idx = _json.load(_f)
+                _shards = sorted(set(_idx.get("weight_map", {}).values()))
+                self.print_and_status_update(f"Loading {len(_shards)} sharded safetensors from {_tdir}")
+                transformer_state_dict = {}
+                for shard in _shards:
+                    transformer_state_dict.update(load_file(os.path.join(_tdir, shard), device="cpu"))
+            else:
+                raise FileNotFoundError(
+                    f"No single checkpoint ({self.flux2_te_filename}) or sharded index found in {transformer_path}"
+                )
+        else:
+            if not os.path.exists(transformer_path):
+                transformer_path = huggingface_hub.hf_hub_download(
+                    repo_id=model_path,
+                    filename=self.flux2_te_filename,
+                    token=HF_TOKEN,
+                )
+            transformer_state_dict = load_file(transformer_path, device="cpu")
         has_fp8_weights = any(
             v.dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
             for v in transformer_state_dict.values()
