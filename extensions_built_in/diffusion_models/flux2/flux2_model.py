@@ -19,7 +19,7 @@ from optimum.quanto import freeze, QTensor
 from toolkit.util.quantize import quantize, get_qtype, quantize_model
 
 from transformers import AutoProcessor, Mistral3ForConditionalGeneration
-from .src.model import Flux2, Flux2Params, apply_fp8_checkpoint_to_linears
+from .src.model import Flux2, Flux2Params, apply_fp8_checkpoint_to_linears, apply_nvfp4_checkpoint_to_linears
 from .src.pipeline import Flux2Pipeline
 from .src.autoencoder import AutoEncoder, AutoEncoderParams
 from safetensors.torch import load_file, save_file
@@ -141,9 +141,45 @@ class Flux2Model(BaseModel):
             or self.model_config.model_kwargs.get("fp8_native_training", False)
             or getattr(self.model_config, "fp8_native_training", False)
         )
+        use_torchao_f8 = bool(
+            getattr(self.model_config, "float8_torchao_training", False)
+        )
+        use_nvfp4_native = bool(
+            self.model_config.model_kwargs.get("nvfp4_native_training", False)
+            or getattr(self.model_config, "nvfp4_native_training", False)
+        )
+        use_fouroversix = bool(
+            self.model_config.model_kwargs.get("fouroversix_fp4_training", False)
+            or getattr(self.model_config, "fouroversix_fp4_training", False)
+        )
+        # Mutual exclusion: torchao path supersedes FP8ScaledLinear path for training
+        if use_fouroversix and (use_fp8_native or use_torchao_f8 or use_nvfp4_native):
+            self.print_and_status_update(
+                "fouroversix_fp4_training supersedes FP8/TorchAO/NVFP4 paths"
+            )
+            use_fp8_native = False
+            use_torchao_f8 = False
+            use_nvfp4_native = False
+        if use_torchao_f8 and use_fp8_native:
+            self.print_and_status_update(
+                "float8_torchao_training supersedes fp8_native_training; disabling FP8ScaledLinear path"
+            )
+            use_fp8_native = False
+        if use_nvfp4_native and (use_fp8_native or use_torchao_f8):
+            self.print_and_status_update(
+                "nvfp4_native_training supersedes FP8/TorchAO paths"
+            )
+            use_fp8_native = False
+            use_torchao_f8 = False
 
-        # use local path if provided — prefer FP8 checkpoint files when native FP8 is enabled
-        if use_fp8_native and os.path.isdir(transformer_path):
+        # use local path if provided — prefer matching checkpoint files
+        if use_nvfp4_native and os.path.isdir(transformer_path):
+            import glob
+            nvfp4_candidates = sorted(glob.glob(os.path.join(transformer_path, "*nvfp4*.safetensors")))
+            if nvfp4_candidates:
+                transformer_path = nvfp4_candidates[0]
+                self.print_and_status_update(f"Using NVFP4 checkpoint: {os.path.basename(transformer_path)}")
+        elif (use_fp8_native or use_torchao_f8) and os.path.isdir(transformer_path):
             import glob
             fp8_candidates = sorted(glob.glob(os.path.join(transformer_path, "*fp8*.safetensors")))
             if fp8_candidates:
@@ -165,6 +201,9 @@ class Flux2Model(BaseModel):
             v.dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
             for v in transformer_state_dict.values()
         )
+        has_nvfp4_weights = any(
+            k.endswith(".weight_scale_2") for k in transformer_state_dict
+        )
 
         if use_fp8_native:
             if not has_fp8_weights:
@@ -180,33 +219,123 @@ class Flux2Model(BaseModel):
                     "FP8 native mode requested but this torch build has no torch._scaled_mm."
                 )
 
-        if use_fp8_native:
+        if use_nvfp4_native:
+            if not has_nvfp4_weights:
+                raise RuntimeError(
+                    "NVFP4 native mode enabled but checkpoint has no NVFP4 weight tensors "
+                    "(missing weight_scale_2 keys)."
+                )
+            if self.model_config.quantize:
+                raise RuntimeError(
+                    "NVFP4 native mode is incompatible with quantize=True."
+                )
+            if not hasattr(torch, "_scaled_mm"):
+                raise RuntimeError(
+                    "NVFP4 native mode requested but this torch build has no torch._scaled_mm."
+                )
+
+        if use_torchao_f8 and self.model_config.quantize:
+            raise RuntimeError(
+                "float8_torchao_training is incompatible with quantize=True."
+            )
+
+        if use_nvfp4_native:
+            replaced = apply_nvfp4_checkpoint_to_linears(transformer, transformer_state_dict)
+            self.print_and_status_update(
+                f"Installed native NVFP4 wrappers for {replaced} linear layers"
+            )
+        elif use_fp8_native:
             replaced = apply_fp8_checkpoint_to_linears(transformer, transformer_state_dict)
             self.print_and_status_update(
                 f"Installed native FP8 wrappers for {replaced} linear layers"
             )
 
-        # Build load dict for regular parameters only.
+        # Build load dict — skip keys already handled by quantized wrappers
         load_state_dict = {}
-        for key, value in transformer_state_dict.items():
-            if key.endswith("input_scale") or key.endswith("weight_scale"):
-                continue
-            if value.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
-                continue
-            load_state_dict[key] = value.to(dtype)
+        _SKIP_SUFFIXES = ("input_scale", "weight_scale", "weight_scale_2")
+        if use_torchao_f8 and has_fp8_weights:
+            scale_map = {}
+            for key, value in transformer_state_dict.items():
+                if key.endswith(".weight_scale"):
+                    base = key[: -len(".weight_scale")]
+                    scale_map[base] = value
+            for key, value in transformer_state_dict.items():
+                if any(key.endswith(s) for s in _SKIP_SUFFIXES):
+                    continue
+                if value.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+                    base = key.rsplit(".", 1)[0] if "." in key else key
+                    scale = scale_map.get(base)
+                    if scale is not None:
+                        load_state_dict[key] = (value.to(dtype) * scale.to(dtype))
+                    else:
+                        load_state_dict[key] = value.to(dtype)
+                else:
+                    load_state_dict[key] = value.to(dtype)
+            self.print_and_status_update(
+                f"Dequantized FP8 checkpoint to {dtype} for TorchAO training"
+            )
+        elif use_nvfp4_native:
+            for key, value in transformer_state_dict.items():
+                if any(key.endswith(s) for s in _SKIP_SUFFIXES):
+                    continue
+                if value.dtype == torch.uint8:
+                    continue
+                if value.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+                    continue
+                load_state_dict[key] = value.to(dtype)
+        elif use_fp8_native:
+            for key, value in transformer_state_dict.items():
+                if any(key.endswith(s) for s in _SKIP_SUFFIXES):
+                    continue
+                if value.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+                    continue
+                load_state_dict[key] = value.to(dtype)
+        else:
+            for key, value in transformer_state_dict.items():
+                if any(key.endswith(s) for s in _SKIP_SUFFIXES):
+                    continue
+                if value.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+                    continue
+                load_state_dict[key] = value.to(dtype)
 
+        use_special_load = use_fp8_native or use_torchao_f8 or use_nvfp4_native
         load_result = transformer.load_state_dict(
             load_state_dict,
-            strict=not use_fp8_native,
+            strict=not use_special_load,
             assign=True,
         )
-        if use_fp8_native and len(load_result.unexpected_keys) > 0:
+        if use_special_load and len(load_result.unexpected_keys) > 0:
             raise RuntimeError(
-                f"Unexpected keys while loading FP8 model: {load_result.unexpected_keys[:10]}"
+                f"Unexpected keys while loading model: {load_result.unexpected_keys[:10]}"
             )
 
-        if use_fp8_native:
+        if use_fouroversix:
+            transformer.to(self.device_torch, dtype=dtype)
+            from .src.model import apply_fouroversix_to_linears
+            replaced = apply_fouroversix_to_linears(transformer)
+            self.print_and_status_update(
+                f"fouroversix: quantized {replaced} linear layers to NVFP4"
+            )
+            flush()
+        elif use_nvfp4_native:
             transformer.to(self.device_torch)
+        elif use_fp8_native:
+            transformer.to(self.device_torch)
+        elif use_torchao_f8:
+            transformer.to(self.device_torch, dtype=dtype)
+            from torchao.float8 import convert_to_float8_training, Float8LinearConfig
+            from dataclasses import replace
+            f8_config = Float8LinearConfig.from_recipe_name("tensorwise")
+            f8_config = replace(f8_config, pad_inner_dim=True)
+            def _f8_filter(mod, fqn):
+                if not isinstance(mod, torch.nn.Linear):
+                    return False
+                return mod.in_features % 16 == 0 and mod.out_features % 16 == 0
+            convert_to_float8_training(transformer, config=f8_config, module_filter_fn=_f8_filter)
+            n_converted = sum(1 for m in transformer.modules() if m.__class__.__name__ == "Float8Linear")
+            self.print_and_status_update(
+                f"TorchAO: converted {n_converted} linear layers to Float8Linear"
+            )
         else:
             transformer.to(self.quantize_device, dtype=dtype)
 
@@ -216,7 +345,7 @@ class Flux2Model(BaseModel):
             self.print_and_status_update("Quantizing Transformer")
             quantize_model(self, transformer)
             flush()
-        elif not use_fp8_native:
+        elif not use_fp8_native and not use_torchao_f8 and not use_nvfp4_native and not use_fouroversix:
             transformer.to(self.device_torch, dtype=dtype)
         flush()
 
@@ -234,7 +363,21 @@ class Flux2Model(BaseModel):
             self.print_and_status_update("Moving transformer to CPU")
             transformer.to("cpu")
 
+        # TorchAO Float8Linear keeps full BF16 weights on GPU; temporarily
+        # offload to CPU so the text encoder can load and be quantized.
+        _torchao_offloaded = False
+        if use_torchao_f8 and not self.model_config.low_vram:
+            self.print_and_status_update("Offloading transformer to CPU for TE load")
+            transformer.to("cpu")
+            flush()
+            _torchao_offloaded = True
+
         text_encoder, tokenizer = self.load_te()
+
+        if _torchao_offloaded:
+            self.print_and_status_update("Moving transformer back to GPU")
+            transformer.to(self.device_torch)
+            flush()
 
         self.print_and_status_update("Loading VAE")
         vae_path = self.model_config.vae_path

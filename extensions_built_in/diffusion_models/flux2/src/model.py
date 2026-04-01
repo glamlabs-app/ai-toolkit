@@ -1,11 +1,108 @@
+import threading
+
 import torch
 from einops import rearrange
 from torch import Tensor, nn
 import torch.utils.checkpoint as ckpt
+from torch.utils.checkpoint import CheckpointPolicy, create_selective_checkpoint_contexts
+from toolkit.offloaded_checkpoint import offloaded_checkpoint
 import math
 import os
 from dataclasses import dataclass, field
 from typing import Optional
+
+
+# ---------------------------------------------------------------------------
+# Selective Activation Checkpointing (SAC) policy
+# ---------------------------------------------------------------------------
+# Save outputs of expensive ops (matmuls, attention) so they aren't recomputed
+# during backward.  Recompute cheap ops (norms, activations, element-wise).
+_SAC_SAVE_OPS = frozenset({
+    torch.ops.aten.mm.default,
+    torch.ops.aten.addmm.default,
+    torch.ops.aten.bmm.default,
+    torch.ops.aten._scaled_mm.default,
+    torch.ops.aten._scaled_dot_product_flash_attention.default,
+    torch.ops.aten._scaled_dot_product_efficient_attention.default,
+    torch.ops.aten._scaled_dot_product_cudnn_attention.default,
+})
+
+
+def _sac_policy_fn(ctx, op, *args, **kwargs):
+    if op in _SAC_SAVE_OPS:
+        return CheckpointPolicy.MUST_SAVE
+    return CheckpointPolicy.PREFER_RECOMPUTE
+
+
+# ---------------------------------------------------------------------------
+# Recompute cache for non-aten ops (fouroversix fp4_matmul, etc.)
+# ---------------------------------------------------------------------------
+# Custom C++ extension ops are invisible to the SAC policy, so their outputs
+# would be recomputed during checkpoint replay.  This FIFO cache stores their
+# outputs during the initial forward and returns them during replay, skipping
+# the expensive kernel re-execution.
+#
+# Safe because _FourOverSixLinearFn.backward only needs grad_output + frozen
+# weights — it never uses the forward input or output value.
+class _NonAtenRecomputeCache:
+    _local = threading.local()
+
+    def __init__(self):
+        self.outputs: list[Tensor] = []
+        self.idx: int = 0
+        self.mode: str | None = None  # 'save' or 'recompute'
+
+    @classmethod
+    def active(cls) -> "_NonAtenRecomputeCache | None":
+        return getattr(cls._local, "inst", None)
+
+    @classmethod
+    def _install(cls, inst: "_NonAtenRecomputeCache | None"):
+        cls._local.inst = inst
+
+    def save_output(self, out: Tensor):
+        if self.mode == "save":
+            self.outputs.append(out.detach())
+
+    def get_cached(self) -> Tensor | None:
+        if self.mode == "recompute" and self.idx < len(self.outputs):
+            out = self.outputs[self.idx]
+            self.idx += 1
+            return out
+        return None
+
+
+def _sac_context_fn():
+    save_ctx, recompute_ctx = create_selective_checkpoint_contexts(_sac_policy_fn)
+    cache = _NonAtenRecomputeCache()
+
+    class _SaveContext:
+        def __enter__(self_):
+            cache.mode = "save"
+            cache.outputs.clear()
+            cache.idx = 0
+            _NonAtenRecomputeCache._install(cache)
+            return save_ctx.__enter__()
+
+        def __exit__(self_, *args):
+            cache.mode = None
+            _NonAtenRecomputeCache._install(None)
+            return save_ctx.__exit__(*args)
+
+    class _RecomputeContext:
+        def __enter__(self_):
+            cache.mode = "recompute"
+            cache.idx = 0
+            _NonAtenRecomputeCache._install(cache)
+            return recompute_ctx.__enter__()
+
+        def __exit__(self_, *args):
+            cache.mode = None
+            cache.outputs.clear()
+            _NonAtenRecomputeCache._install(None)
+            return recompute_ctx.__exit__(*args)
+
+    return _SaveContext(), _RecomputeContext()
 
 
 @dataclass
@@ -270,6 +367,654 @@ def apply_fp8_checkpoint_to_linears(
     return replaced
 
 
+# ── NVFP4 (Native FP4) support ──────────────────────────────────────────
+# Two-level block-scaled 4-bit weights (float4_e2m1fn_x2) from BFL
+# FLUX.2 Klein NVFP4 checkpoints.  Forward uses torch._scaled_mm FP4
+# tensor-core kernels on Blackwell; backward dequantizes to BF16 for
+# grad_x (frozen base, no grad_weight).
+# ─────────────────────────────────────────────────────────────────────────
+
+_NVFP4_E2M1_LUT: Optional[Tensor] = None
+_NVFP4_QUANT_BOUNDS: Optional[Tensor] = None
+_NVFP4_MAX = 6.0
+
+_USE_TRITON_NVFP4: Optional[bool] = None
+
+def _check_triton_nvfp4() -> bool:
+    global _USE_TRITON_NVFP4
+    if _USE_TRITON_NVFP4 is not None:
+        return _USE_TRITON_NVFP4
+    if os.getenv("NVFP4_NO_TRITON", "0") == "1":
+        _USE_TRITON_NVFP4 = False
+        return False
+    try:
+        import triton  # noqa: F401
+        if torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 10:
+            _USE_TRITON_NVFP4 = True
+            return True
+    except ImportError:
+        pass
+    _USE_TRITON_NVFP4 = False
+    return False
+
+
+def _nvfp4_lut(device: torch.device) -> Tensor:
+    """16-entry E2M1fn lookup table (lazy, per-device)."""
+    global _NVFP4_E2M1_LUT
+    if _NVFP4_E2M1_LUT is None or _NVFP4_E2M1_LUT.device != device:
+        _NVFP4_E2M1_LUT = torch.tensor(
+            # positive                              negative
+            [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
+             0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0],
+            dtype=torch.bfloat16, device=device,
+        )
+    return _NVFP4_E2M1_LUT
+
+
+def _nvfp4_bounds(device: torch.device) -> Tensor:
+    """Midpoint boundaries between adjacent E2M1 magnitudes (lazy)."""
+    global _NVFP4_QUANT_BOUNDS
+    if _NVFP4_QUANT_BOUNDS is None or _NVFP4_QUANT_BOUNDS.device != device:
+        _NVFP4_QUANT_BOUNDS = torch.tensor(
+            [0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0],
+            dtype=torch.float32, device=device,
+        )
+    return _NVFP4_QUANT_BOUNDS
+
+
+# ── Triton NVFP4 kernels (Blackwell sm_100+) ─────────────────────────────
+
+def _get_triton_nvfp4_kernels():
+    """Lazy-import Triton kernels to avoid import cost when not needed."""
+    import triton
+    import triton.language as tl
+
+    @triton.jit
+    def _triton_quantize_nvfp4_kernel(
+        x_ptr, packed_ptr, scale_ptr,
+        num_blocks,
+        TILE: tl.constexpr,
+    ):
+        """Quantize BF16 activations to NVFP4 (1×16 block scaling).
+
+        Each program handles TILE blocks of 16 values.
+        Uses Blackwell cvt.rn.satfinite.e2m1x2.f32 PTX for hardware rounding.
+        """
+        pid = tl.program_id(0)
+        block_ids = pid * TILE + tl.arange(0, TILE)
+        mask = block_ids < num_blocks
+
+        base_offsets = block_ids[:, None] * 16 + tl.arange(0, 16)[None, :]
+        vals = tl.load(x_ptr + base_offsets, mask=mask[:, None], other=0.0).to(tl.float32)
+
+        amax = tl.max(tl.abs(vals), axis=1)
+        amax = tl.maximum(amax, 1e-12)
+
+        scaled = vals * (6.0 / amax)[:, None]
+
+        pairs = scaled.reshape(TILE, 8, 2)
+        (lo, hi) = pairs.split()
+
+        packed = tl.inline_asm_elementwise(
+            asm="""
+            {
+            .reg .b8 byte0, byte1, byte2, byte3;
+            cvt.rn.satfinite.e2m1x2.f32 byte0, $5, $1;
+            cvt.rn.satfinite.e2m1x2.f32 byte1, $6, $2;
+            cvt.rn.satfinite.e2m1x2.f32 byte2, $7, $3;
+            cvt.rn.satfinite.e2m1x2.f32 byte3, $8, $4;
+            mov.b32 $0, {byte0, byte1, byte2, byte3};
+            }
+            """,
+            constraints="=r,r,r,r,r,r,r,r,r",
+            args=[lo, hi],
+            dtype=tl.uint8,
+            is_pure=True,
+            pack=4,
+        )
+
+        out_offsets = block_ids[:, None] * 8 + tl.arange(0, 8)[None, :]
+        tl.store(packed_ptr + out_offsets, packed, mask=mask[:, None])
+
+        scale_vals = (amax / 6.0).to(tl.float8e4nv)
+        tl.store(scale_ptr + block_ids, scale_vals, mask=mask)
+
+    @triton.jit
+    def _triton_dequant_nvfp4_kernel(
+        w_ptr, scale_ptr, scale2_ptr, out_ptr,
+        num_rows, in_packed,
+        BLOCK_M: tl.constexpr, BLOCK_K: tl.constexpr,
+    ):
+        """Dequantize NVFP4 packed uint8 weights to BF16.
+
+        Each block handles BLOCK_M rows × BLOCK_K packed columns.
+        Passes each full byte to cvt.rn.f16x2.e2m1x2 to get both
+        lo/hi FP4 values in one instruction.
+        """
+        pid_m = tl.program_id(0)
+        pid_k = tl.program_id(1)
+
+        row_offs = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+        col_offs = pid_k * BLOCK_K + tl.arange(0, BLOCK_K)
+
+        row_mask = row_offs < num_rows
+        col_mask = col_offs < in_packed
+        mask = row_mask[:, None] & col_mask[None, :]
+
+        w_idx = row_offs[:, None] * in_packed + col_offs[None, :]
+        w_u32 = tl.load(w_ptr + w_idx, mask=mask, other=0).to(tl.uint32)
+
+        fp16x2 = tl.inline_asm_elementwise(
+            asm="cvt.rn.f16x2.e2m1x2 $0, $1;",
+            constraints="=r,r",
+            args=[w_u32],
+            dtype=tl.uint32,
+            is_pure=True,
+            pack=1,
+        )
+
+        lo_bf16 = (fp16x2 & 0xFFFF).to(tl.uint16).to(tl.float16, bitcast=True).to(tl.bfloat16)
+        hi_bf16 = ((fp16x2 >> 16) & 0xFFFF).to(tl.uint16).to(tl.float16, bitcast=True).to(tl.bfloat16)
+
+        n_scale_cols = in_packed // 8
+        scale_col = col_offs // 8
+        scale_idx = row_offs[:, None] * n_scale_cols + scale_col[None, :]
+        scale_mask = row_mask[:, None] & (scale_col < n_scale_cols)[None, :]
+        scales = tl.load(scale_ptr + scale_idx, mask=scale_mask, other=0).to(tl.bfloat16)
+
+        scale2 = tl.load(scale2_ptr).to(tl.bfloat16)
+
+        lo_val = lo_bf16 * scales * scale2
+        hi_val = hi_bf16 * scales * scale2
+
+        K_out = in_packed * 2
+        lo_col = col_offs * 2
+        hi_col = col_offs * 2 + 1
+
+        lo_idx = row_offs[:, None] * K_out + lo_col[None, :]
+        hi_idx = row_offs[:, None] * K_out + hi_col[None, :]
+
+        out_mask = row_mask[:, None] & col_mask[None, :]
+        tl.store(out_ptr + lo_idx, lo_val, mask=out_mask)
+        tl.store(out_ptr + hi_idx, hi_val, mask=out_mask)
+
+    return _triton_quantize_nvfp4_kernel, _triton_dequant_nvfp4_kernel
+
+_triton_kernels_cache = {}
+
+def _triton_quantize_to_nvfp4(x_2d: Tensor) -> tuple[Tensor, Tensor]:
+    """Triton-accelerated NVFP4 quantization using hardware e2m1 conversion."""
+    M, K = x_2d.shape
+    num_blocks = (M * K) // 16
+
+    packed_flat = torch.empty(num_blocks * 8, dtype=torch.uint8, device=x_2d.device)
+    scales = torch.empty(num_blocks, dtype=torch.float8_e4m3fn, device=x_2d.device)
+
+    if 'quant' not in _triton_kernels_cache:
+        q_kernel, d_kernel = _get_triton_nvfp4_kernels()
+        _triton_kernels_cache['quant'] = q_kernel
+        _triton_kernels_cache['dequant'] = d_kernel
+    q_kernel = _triton_kernels_cache['quant']
+
+    TILE = 64
+    grid = ((num_blocks + TILE - 1) // TILE,)
+    q_kernel[grid](x_2d, packed_flat, scales, num_blocks, TILE=TILE)
+
+    x_fp4 = packed_flat.reshape(M, K // 2).view(torch.float4_e2m1fn_x2)
+    return x_fp4, scales.contiguous()
+
+
+def _triton_nvfp4_dequant(
+    weight_uint8: Tensor,
+    weight_scale: Tensor,
+    weight_scale_2: Tensor,
+) -> Tensor:
+    """Triton-accelerated NVFP4 dequantization using hardware e2m1→fp16 conversion."""
+    out_features, in_packed = weight_uint8.shape
+    in_features = in_packed * 2
+    out = torch.empty(out_features, in_features, dtype=torch.bfloat16, device=weight_uint8.device)
+
+    if 'dequant' not in _triton_kernels_cache:
+        q_kernel, d_kernel = _get_triton_nvfp4_kernels()
+        _triton_kernels_cache['quant'] = q_kernel
+        _triton_kernels_cache['dequant'] = d_kernel
+    d_kernel = _triton_kernels_cache['dequant']
+
+    BLOCK_M = 32
+    BLOCK_K = min(128, in_packed)
+    grid = (
+        (out_features + BLOCK_M - 1) // BLOCK_M,
+        (in_packed + BLOCK_K - 1) // BLOCK_K,
+    )
+    d_kernel[grid](
+        weight_uint8, weight_scale, weight_scale_2, out,
+        out_features, in_packed,
+        BLOCK_M=BLOCK_M, BLOCK_K=BLOCK_K,
+    )
+    return out
+
+
+# ── Pure-PyTorch fallbacks ────────────────────────────────────────────────
+
+def _nvfp4_dequant(
+    weight_uint8: Tensor,
+    weight_scale: Tensor,
+    weight_scale_2: Tensor,
+) -> Tensor:
+    """Dequantize NVFP4 packed uint8 weights to BF16.
+
+    Args:
+        weight_uint8:  [out_features, in_packed] uint8  (2 fp4 per byte)
+        weight_scale:  [out_features, in_packed // 8] float8_e4m3fn
+        weight_scale_2: scalar float32  (tensor-level second scale)
+    Returns:
+        [out_features, in_features] bfloat16
+    """
+    if _check_triton_nvfp4():
+        return _triton_nvfp4_dequant(weight_uint8, weight_scale, weight_scale_2)
+    lut = _nvfp4_lut(weight_uint8.device)
+    lo = (weight_uint8 & 0x0F).long()
+    hi = ((weight_uint8 >> 4) & 0x0F).long()
+    w_bf16 = torch.stack([lut[lo], lut[hi]], dim=-1).reshape(
+        weight_uint8.shape[0], weight_uint8.shape[1] * 2,
+    )
+    ws = weight_scale.to(torch.bfloat16).unsqueeze(-1).expand(
+        -1, -1, 16,
+    ).reshape(weight_uint8.shape[0], weight_uint8.shape[1] * 2)
+    return w_bf16 * ws * weight_scale_2.to(torch.bfloat16)
+
+
+def _quantize_to_nvfp4(x_2d: Tensor) -> tuple[Tensor, Tensor]:
+    """Quantize [M, K] BF16 tensor to NVFP4 for ``_scaled_mm``.
+
+    Uses block_size = 16 fp4 values (matching cuBLAS NVFP4 1×16 scaling).
+
+    Returns:
+        x_fp4:      [M, K // 2] float4_e2m1fn_x2
+        scale_e4m3: 1-D float8_e4m3fn, length M * K // 16
+    """
+    if _check_triton_nvfp4():
+        return _triton_quantize_to_nvfp4(x_2d)
+    M, K = x_2d.shape
+    x_blocks = x_2d.reshape(-1, 16).float()
+
+    amax = x_blocks.abs().amax(dim=1, keepdim=True).clamp(min=1e-12)
+    scale = amax / _NVFP4_MAX
+    x_scaled = (x_blocks / scale).clamp(-_NVFP4_MAX, _NVFP4_MAX)
+
+    sign = (x_scaled < 0).to(torch.uint8)
+    codes = torch.bucketize(x_scaled.abs(), _nvfp4_bounds(x_2d.device)).to(torch.uint8)
+    codes = codes | (sign << 3)
+
+    codes_pairs = codes.reshape(-1, 8, 2)
+    packed = (codes_pairs[:, :, 1] << 4) | codes_pairs[:, :, 0]
+    x_fp4 = packed.reshape(M, K // 2).view(torch.float4_e2m1fn_x2)
+
+    return x_fp4, scale.squeeze(-1).to(torch.float8_e4m3fn).contiguous()
+
+
+class _NVFP4LinearFn(torch.autograd.Function):
+    """NVFP4 scaled matmul with BF16 backward for LoRA training.
+
+    Forward:  quantize activations to FP4, _scaled_mm  (FP4 tensor cores)
+    Backward: dequantize weight to BF16, grad_x = grad @ weight_bf16
+              (no grad_weight — base is frozen)
+    """
+
+    @staticmethod
+    def forward(
+        ctx,
+        x_2d: Tensor,
+        weight_uint8: Tensor,
+        weight_scale: Tensor,
+        weight_scale_2: Tensor,
+    ) -> Tensor:
+        out_dtype = x_2d.dtype
+
+        x_fp4, x_scale = _quantize_to_nvfp4(x_2d)
+        w_fp4 = weight_uint8.view(torch.float4_e2m1fn_x2)
+        w_scale_flat = weight_scale.flatten().contiguous()
+
+        out = torch._scaled_mm(
+            x_fp4, w_fp4.t(),
+            scale_a=x_scale, scale_b=w_scale_flat,
+            out_dtype=out_dtype,
+        )
+        if isinstance(out, tuple):
+            out = out[0]
+        out = out * weight_scale_2.to(out_dtype)
+
+        ctx.save_for_backward(weight_uint8, weight_scale, weight_scale_2)
+        ctx.out_dtype = out_dtype
+        return out
+
+    @staticmethod
+    def backward(ctx, grad_output: Tensor):
+        weight_uint8, weight_scale, weight_scale_2 = ctx.saved_tensors
+        w_bf16 = _nvfp4_dequant(weight_uint8, weight_scale, weight_scale_2)
+        grad_x = grad_output.contiguous() @ w_bf16
+        return grad_x, None, None, None
+
+
+class NVFP4ScaledLinear(nn.Module):
+    """Linear layer backed by NVFP4 packed weights + two-level block scales.
+
+    Stores weights as uint8 (2 × fp4 per byte) with per-16-element e4m3
+    block scales and a per-tensor fp32 second scale.  Forward dispatches to
+    FP4 tensor-core ``_scaled_mm`` when CUDA is available, with an automatic
+    fallback to dequant-to-BF16 matmul.
+    """
+
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        weight_uint8: Tensor,
+        weight_scale: Tensor,
+        weight_scale_2: Tensor,
+        input_scale: Optional[Tensor] = None,
+        bias: Optional[Tensor] = None,
+    ):
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.register_buffer("weight_uint8", weight_uint8, persistent=False)
+        self.register_buffer("weight_scale", weight_scale, persistent=False)
+        self.register_buffer("weight_scale_2", weight_scale_2.float(), persistent=False)
+        if input_scale is not None:
+            self.register_buffer("input_scale", input_scale.float(), persistent=False)
+        else:
+            self.input_scale = None
+        if bias is not None:
+            self.register_buffer("bias", bias, persistent=False)
+        else:
+            self.bias = None
+        self._use_fp4_mm = os.getenv("NVFP4_DEQUANT_ONLY", "0") != "1"
+        self._logged_once = False
+
+    def forward(self, x: Tensor) -> Tensor:
+        leading = x.shape[:-1]
+        x2d = x.reshape(-1, x.shape[-1]).contiguous()
+
+        if x.is_cuda and self._use_fp4_mm:
+            try:
+                out2d = self._forward_fp4(x2d)
+            except RuntimeError:
+                self._use_fp4_mm = False
+                out2d = self._forward_dequant(x2d)
+        else:
+            out2d = self._forward_dequant(x2d)
+
+        if self.bias is not None:
+            out2d = out2d + self.bias.to(device=out2d.device, dtype=out2d.dtype)
+        return out2d.view(*leading, self.out_features)
+
+    def _forward_fp4(self, x2d: Tensor) -> Tensor:
+        """FP4 tensor-core forward via _scaled_mm."""
+        if torch.is_grad_enabled() and x2d.requires_grad:
+            return _NVFP4LinearFn.apply(
+                x2d, self.weight_uint8, self.weight_scale, self.weight_scale_2,
+            )
+
+        x_fp4, x_scale = _quantize_to_nvfp4(x2d)
+        w_fp4 = self.weight_uint8.view(torch.float4_e2m1fn_x2)
+        w_scale_flat = self.weight_scale.flatten().contiguous()
+
+        if os.getenv("NVFP4_VERBOSE", "0") == "1" and not self._logged_once:
+            print(
+                f"[NVFP4ScaledLinear] scaled_mm x={tuple(x2d.shape)} "
+                f"w_packed={tuple(self.weight_uint8.shape)} "
+                f"w_scale_2={float(self.weight_scale_2)}"
+            )
+            self._logged_once = True
+
+        out = torch._scaled_mm(
+            x_fp4, w_fp4.t(),
+            scale_a=x_scale, scale_b=w_scale_flat,
+            out_dtype=x2d.dtype,
+        )
+        if isinstance(out, tuple):
+            out = out[0]
+        return out * self.weight_scale_2.to(x2d.dtype)
+
+    def _forward_dequant(self, x2d: Tensor) -> Tensor:
+        """BF16 fallback: dequantize weight on the fly."""
+        w_bf16 = _nvfp4_dequant(
+            self.weight_uint8, self.weight_scale, self.weight_scale_2,
+        )
+        return x2d.to(w_bf16.dtype) @ w_bf16.t()
+
+
+def apply_nvfp4_checkpoint_to_linears(
+    model: nn.Module,
+    checkpoint_state_dict: dict[str, Tensor],
+) -> int:
+    """Replace matching nn.Linear modules with NVFP4ScaledLinear wrappers.
+
+    Detects NVFP4 layers by uint8 weight dtype + presence of weight_scale
+    and weight_scale_2 keys in the checkpoint.
+    """
+    replaced = 0
+    for module_name, module in list(model.named_modules()):
+        if not isinstance(module, nn.Linear):
+            continue
+        weight_key = f"{module_name}.weight"
+        if weight_key not in checkpoint_state_dict:
+            continue
+        w = checkpoint_state_dict[weight_key]
+        if w.dtype != torch.uint8:
+            continue
+        scale_key = f"{module_name}.weight_scale"
+        scale2_key = f"{module_name}.weight_scale_2"
+        if scale_key not in checkpoint_state_dict or scale2_key not in checkpoint_state_dict:
+            continue
+
+        ws = checkpoint_state_dict[scale_key]
+        ws2 = checkpoint_state_dict[scale2_key]
+        inp_s = checkpoint_state_dict.get(f"{module_name}.input_scale", None)
+        bias = module.bias.detach().to("cpu") if module.bias is not None else None
+
+        nvfp4_mod = NVFP4ScaledLinear(
+            in_features=module.in_features,
+            out_features=module.out_features,
+            weight_uint8=w.to("cpu"),
+            weight_scale=ws.to("cpu"),
+            weight_scale_2=ws2.to("cpu"),
+            input_scale=inp_s.to("cpu") if inp_s is not None else None,
+            bias=bias,
+        )
+        _set_module_by_name(model, module_name, nvfp4_mod)
+        replaced += 1
+    return replaced
+
+
+# ── fouroversix FP4 support ──────────────────────────────────────────────
+# Uses the fouroversix library for NVFP4 quantization with 4/6 adaptive
+# block scaling.  Provides better quantization quality than standard NVFP4
+# round-to-nearest.  Frozen base weights use FP4 tensor-core matmul;
+# LoRA adapters stay in full-precision BF16.
+# ─────────────────────────────────────────────────────────────────────────
+
+
+class _FourOverSixLinearFn(torch.autograd.Function):
+    """Autograd wrapper: forward and backward both use FP4 tensor-core matmul.
+
+    Forward:  out = fp4_matmul(x, qt_W)      — x @ W^T
+    Backward: grad_x = fp4_matmul(g, qt_WT)  — g @ (W^T)^T = g @ W
+    No grad_weight — the base model is frozen.
+    """
+
+    @staticmethod
+    def forward(
+        ctx,
+        x_2d: Tensor,
+        w_values: Tensor, w_scales: Tensor, w_amax: Tensor,
+        qt_dtype, qt_original_shape, qt_scale_rule, qt_padded_shape,
+        wt_values: Tensor, wt_scales: Tensor, wt_amax: Tensor,
+        qt_t_dtype, qt_t_original_shape, qt_t_scale_rule, qt_t_padded_shape,
+    ) -> Tensor:
+        cache = _NonAtenRecomputeCache.active()
+        cached = cache.get_cached() if cache is not None else None
+        if cached is not None:
+            out = cached
+        else:
+            from fouroversix import fp4_matmul
+            from fouroversix.quantize.quantized_tensor import QuantizedTensor
+
+            qt = QuantizedTensor(
+                w_values, w_scales, w_amax,
+                qt_dtype, qt_original_shape, qt_scale_rule, qt_padded_shape,
+            )
+            out = fp4_matmul(x_2d, qt)
+            if cache is not None:
+                cache.save_output(out)
+
+        ctx.save_for_backward(wt_values, wt_scales, wt_amax)
+        ctx.qt_t_dtype = qt_t_dtype
+        ctx.qt_t_original_shape = qt_t_original_shape
+        ctx.qt_t_scale_rule = qt_t_scale_rule
+        ctx.qt_t_padded_shape = qt_t_padded_shape
+        return out
+
+    @staticmethod
+    def backward(ctx, grad_output: Tensor):
+        wt_values, wt_scales, wt_amax = ctx.saved_tensors
+        from fouroversix import fp4_matmul
+        from fouroversix.quantize.quantized_tensor import QuantizedTensor
+
+        qt_t = QuantizedTensor(
+            wt_values, wt_scales, wt_amax,
+            ctx.qt_t_dtype, ctx.qt_t_original_shape,
+            ctx.qt_t_scale_rule, ctx.qt_t_padded_shape,
+        )
+        grad_x = fp4_matmul(grad_output.contiguous(), qt_t)
+        return (grad_x,) + (None,) * 14
+
+
+class FourOverSixScaledLinear(nn.Module):
+    """Linear layer using fouroversix NVFP4 with 4/6 adaptive block scaling.
+
+    Stores pre-quantized FP4 weights for both W and W^T so that forward
+    and backward both run entirely on FP4 tensor cores (no dequantization).
+    """
+
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        qt_w,   # QuantizedTensor for W   (forward:  x @ W^T)
+        qt_wt,  # QuantizedTensor for W^T (backward: grad @ W)
+        bias: Optional[Tensor] = None,
+    ):
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+
+        self.register_buffer("_qw_values", qt_w.values, persistent=False)
+        self.register_buffer("_qw_scales", qt_w.scale_factors, persistent=False)
+        self.register_buffer("_qw_amax", qt_w.amax, persistent=False)
+        self._qt_dtype = qt_w.dtype
+        self._qt_original_shape = qt_w.original_shape
+        self._qt_scale_rule = qt_w.scale_rule
+        self._qt_padded_shape = qt_w.padded_shape
+
+        self.register_buffer("_qwt_values", qt_wt.values, persistent=False)
+        self.register_buffer("_qwt_scales", qt_wt.scale_factors, persistent=False)
+        self.register_buffer("_qwt_amax", qt_wt.amax, persistent=False)
+        self._qt_t_dtype = qt_wt.dtype
+        self._qt_t_original_shape = qt_wt.original_shape
+        self._qt_t_scale_rule = qt_wt.scale_rule
+        self._qt_t_padded_shape = qt_wt.padded_shape
+
+        if bias is not None:
+            self.register_buffer("bias", bias, persistent=False)
+        else:
+            self.bias = None
+
+    _PROTECTED_BUFFERS = frozenset({
+        "_qw_values", "_qw_scales", "_qw_amax",
+        "_qwt_values", "_qwt_scales", "_qwt_amax",
+    })
+
+    def _apply(self, fn, recurse=True):
+        """Prevent .to(dtype=...) from casting quantized buffers."""
+        saved = {k: self._buffers[k] for k in self._PROTECTED_BUFFERS if k in self._buffers}
+        result = super()._apply(fn, recurse=recurse)
+        for k, v in saved.items():
+            self._buffers[k] = v.to(device=self._buffers[k].device)
+        return result
+
+    def _make_qt(self):
+        from fouroversix.quantize.quantized_tensor import QuantizedTensor
+        return QuantizedTensor(
+            self._qw_values, self._qw_scales, self._qw_amax,
+            self._qt_dtype, self._qt_original_shape,
+            self._qt_scale_rule, self._qt_padded_shape,
+        )
+
+    def forward(self, x: Tensor) -> Tensor:
+        leading = x.shape[:-1]
+        x2d = x.reshape(-1, x.shape[-1]).contiguous()
+
+        if torch.is_grad_enabled() and x2d.requires_grad:
+            out2d = _FourOverSixLinearFn.apply(
+                x2d,
+                self._qw_values, self._qw_scales, self._qw_amax,
+                self._qt_dtype, self._qt_original_shape,
+                self._qt_scale_rule, self._qt_padded_shape,
+                self._qwt_values, self._qwt_scales, self._qwt_amax,
+                self._qt_t_dtype, self._qt_t_original_shape,
+                self._qt_t_scale_rule, self._qt_t_padded_shape,
+            )
+        else:
+            from fouroversix import fp4_matmul
+            out2d = fp4_matmul(x2d, self._make_qt())
+
+        if self.bias is not None:
+            out2d = out2d + self.bias.to(device=out2d.device, dtype=out2d.dtype)
+        return out2d.view(*leading, self.out_features)
+
+
+def apply_fouroversix_to_linears(
+    model: nn.Module,
+    skip_patterns: tuple[str, ...] = ("lora",),
+) -> int:
+    """Replace nn.Linear modules with FourOverSixScaledLinear (NVFP4 4/6).
+
+    Quantizes both W and W^T so forward and backward are both FP4 matmuls
+    on Blackwell tensor cores.  Meant to be called **before** LoRA so that
+    LoRA adapters sit on top of the quantized base in full-precision BF16.
+
+    Returns the number of replaced modules.
+    """
+    from fouroversix import quantize_to_fp4
+
+    replaced = 0
+    for module_name, module in list(model.named_modules()):
+        if not isinstance(module, nn.Linear):
+            continue
+        if any(p in module_name.lower() for p in skip_patterns):
+            continue
+
+        weight = module.weight.data
+        if weight.dtype != torch.bfloat16:
+            weight = weight.to(torch.bfloat16)
+        if not weight.is_cuda:
+            weight = weight.cuda()
+
+        qt_w = quantize_to_fp4(weight)
+        qt_wt = quantize_to_fp4(weight.t().contiguous())
+        bias = module.bias.detach() if module.bias is not None else None
+
+        fos_linear = FourOverSixScaledLinear(
+            module.in_features, module.out_features, qt_w, qt_wt, bias,
+        )
+        _set_module_by_name(model, module_name, fos_linear)
+        replaced += 1
+
+    return replaced
+
+
 class Flux2(nn.Module):
     def __init__(self, params: Flux2Params):
         super().__init__()
@@ -345,6 +1090,8 @@ class Flux2(nn.Module):
         )
 
         self.gradient_checkpointing = False
+        self.selective_checkpointing = False
+        self.offload_checkpoint = False
 
     @property
     def device(self):
@@ -356,6 +1103,14 @@ class Flux2(nn.Module):
 
     def enable_gradient_checkpointing(self):
         self.gradient_checkpointing = True
+
+    def enable_selective_checkpointing(self):
+        self.gradient_checkpointing = True
+        self.selective_checkpointing = True
+
+    def enable_offload_checkpoint(self):
+        self.gradient_checkpointing = True
+        self.offload_checkpoint = True
 
     def forward(
         self,
@@ -384,8 +1139,17 @@ class Flux2(nn.Module):
         pe_x = self.pe_embedder(x_ids)
         pe_ctx = self.pe_embedder(ctx_ids)
 
+        ckpt_kwargs = dict(use_reentrant=False)
+        if self.selective_checkpointing:
+            ckpt_kwargs["context_fn"] = _sac_context_fn
+
         for block in self.double_blocks:
-            if torch.is_grad_enabled() and self.gradient_checkpointing:
+            if torch.is_grad_enabled() and self.offload_checkpoint:
+                img, txt = offloaded_checkpoint(
+                    block, img, txt, pe_x, pe_ctx,
+                    double_block_mod_img, double_block_mod_txt,
+                )
+            elif torch.is_grad_enabled() and self.gradient_checkpointing:
                 img, txt = ckpt.checkpoint(
                     block,
                     img,
@@ -394,7 +1158,7 @@ class Flux2(nn.Module):
                     pe_ctx,
                     double_block_mod_img,
                     double_block_mod_txt,
-                    use_reentrant=False,
+                    **ckpt_kwargs,
                 )
             else:
                 img, txt = block(
@@ -410,13 +1174,15 @@ class Flux2(nn.Module):
         pe = torch.cat((pe_ctx, pe_x), dim=2)
 
         for i, block in enumerate(self.single_blocks):
-            if torch.is_grad_enabled() and self.gradient_checkpointing:
+            if torch.is_grad_enabled() and self.offload_checkpoint:
+                img = offloaded_checkpoint(block, img, pe, single_block_mod)
+            elif torch.is_grad_enabled() and self.gradient_checkpointing:
                 img = ckpt.checkpoint(
                     block,
                     img,
                     pe,
                     single_block_mod,
-                    use_reentrant=False,
+                    **ckpt_kwargs,
                 )
             else:
                 img = block(

@@ -387,6 +387,8 @@ class TrainConfig:
         self.skip_first_sample = kwargs.get('skip_first_sample', False)
         self.force_first_sample = kwargs.get('force_first_sample', False)
         self.gradient_checkpointing = kwargs.get('gradient_checkpointing', True)
+        self.selective_checkpointing = kwargs.get('selective_checkpointing', False)
+        self.offload_checkpoint = kwargs.get('offload_checkpoint', False)
         self.weight_jitter = kwargs.get('weight_jitter', 0.0)
         self.merge_network_on_save = kwargs.get('merge_network_on_save', False)
         self.max_grad_norm = kwargs.get('max_grad_norm', 1.0)
@@ -639,6 +641,13 @@ class ModelConfig:
         # Native FP8 execution path for FP8 checkpoints (inference and/or training).
         self.fp8_native_inference = kwargs.get("fp8_native_inference", False)
         self.fp8_native_training = kwargs.get("fp8_native_training", False)
+        # TorchAO Float8Linear training: converts nn.Linear -> Float8Linear with
+        # dynamic scaling (forward+backward in FP8). Mutually exclusive with
+        # fp8_native_training (FP8ScaledLinear) and quantize for the transformer.
+        self.float8_torchao_training = kwargs.get("float8_torchao_training", False)
+        # Native NVFP4 path for BFL NVFP4 checkpoints (two-level block-scaled fp4).
+        self.nvfp4_native_training = kwargs.get("nvfp4_native_training", False)
+        self.fouroversix_fp4_training = kwargs.get("fouroversix_fp4_training", False)
         self.low_vram = kwargs.get("low_vram", False)
         self.attn_masking = kwargs.get("attn_masking", False)
         if self.attn_masking and not self.is_flux:

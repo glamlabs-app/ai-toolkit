@@ -1681,9 +1681,14 @@ class BaseSDTrainProcess(BaseTrainProcess):
         #     except ImportError:
         #         print_acc("sage attention is not installed. Using SDP instead")
 
-        if self.train_config.gradient_checkpointing:
-            # if has method enable_gradient_checkpointing
-            if hasattr(unet, 'enable_gradient_checkpointing'):
+        if self.train_config.offload_checkpoint and hasattr(unet, 'enable_offload_checkpoint'):
+            unet.enable_offload_checkpoint()
+            print("Offloaded gradient checkpointing enabled (async RAM)")
+        elif self.train_config.gradient_checkpointing:
+            if self.train_config.selective_checkpointing and hasattr(unet, 'enable_selective_checkpointing'):
+                unet.enable_selective_checkpointing()
+                print("Selective activation checkpointing enabled (SAC)")
+            elif hasattr(unet, 'enable_gradient_checkpointing'):
                 unet.enable_gradient_checkpointing()
             elif hasattr(unet, 'gradient_checkpointing'):
                 unet.gradient_checkpointing = True
@@ -1717,8 +1722,13 @@ class BaseSDTrainProcess(BaseTrainProcess):
         else:
             text_encoder.requires_grad_(False)
             text_encoder.eval()
-        _fp8_native = getattr(self.sd.model_config, 'fp8_native_training', False) or getattr(self.sd.model_config, 'fp8_native_inference', False)
-        if _fp8_native:
+        _skip_dtype_cast = (
+            getattr(self.sd.model_config, 'fp8_native_training', False)
+            or getattr(self.sd.model_config, 'fp8_native_inference', False)
+            or getattr(self.sd.model_config, 'float8_torchao_training', False)
+            or getattr(self.sd.model_config, 'nvfp4_native_training', False)
+        )
+        if _skip_dtype_cast:
             unet.to(self.device_torch)
         else:
             unet.to(self.device_torch, dtype=dtype)

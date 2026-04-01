@@ -31,6 +31,9 @@ LINEAR_MODULES = [
     'LoRACompatibleLinear',
     'QLinear',
     'FP8ScaledLinear',
+    'NVFP4ScaledLinear',
+    'FourOverSixScaledLinear',
+    'Float8Linear',
     # 'GroupNorm',
 ]
 CONV_MODULES = [
@@ -69,13 +72,23 @@ class LoRAModule(ToolkitModuleMixin, ExtractableModuleMixin, torch.nn.Module):
         torch.nn.Module.__init__(self)
         self.lora_name = lora_name
         self.orig_module_ref = weakref.ref(org_module)
-        # FP8ScaledLinear stores weight_fp8 buffer instead of weight parameter
         _is_fp8 = hasattr(org_module, 'weight_fp8')
-        if _is_fp8:
+        _is_nvfp4 = hasattr(org_module, 'weight_uint8')
+        _is_fouroversix = hasattr(org_module, '_qw_values')
+        _cls_name = org_module.__class__.__name__
+        if _is_fouroversix:
+            _dev = org_module._qw_values.device
+            self.can_merge_in = False
+        elif _is_nvfp4:
+            _dev = org_module.weight_uint8.device
+            self.can_merge_in = False
+        elif _is_fp8:
             _dev = org_module.weight_fp8.device
             self.can_merge_in = False
         else:
             _dev = org_module.weight.device
+        if _cls_name == 'Float8Linear':
+            self.can_merge_in = False
         self.scalar = torch.tensor(1.0, device=_dev)
         
         # if is ara lora module, mark it on the layer so memory manager can handle it

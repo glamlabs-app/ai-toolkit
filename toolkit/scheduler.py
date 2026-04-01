@@ -35,6 +35,24 @@ def get_lr_scheduler(
         return torch.optim.lr_scheduler.LinearLR(
             optimizer, **kwargs
         )
+    elif name == 'cosine_with_warmup':
+        num_warmup_steps = kwargs.pop('num_warmup_steps', 100)
+        total_iters = kwargs.pop('total_iters', 1000)
+        eta_min = kwargs.pop('eta_min', 0.0)
+        warmup_sched = torch.optim.lr_scheduler.LinearLR(
+            optimizer, start_factor=1e-6, end_factor=1.0,
+            total_iters=num_warmup_steps,
+        )
+        cosine_sched = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=max(total_iters - num_warmup_steps, 1), eta_min=eta_min,
+        )
+        seq = torch.optim.lr_scheduler.SequentialLR(
+            optimizer, schedulers=[warmup_sched, cosine_sched],
+            milestones=[num_warmup_steps],
+        )
+        _orig_step = seq.step
+        seq.step = lambda *args, **kw: _orig_step()
+        return seq
     elif name == 'constant_with_warmup':
         # see if num_warmup_steps is in kwargs
         if 'num_warmup_steps' not in kwargs:
