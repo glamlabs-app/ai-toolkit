@@ -1526,20 +1526,10 @@ class QKNorm(torch.nn.Module):
         return q.to(v), k.to(v)
 
 
-try:
-    from sageattention import sageattn as _sageattn
-    _SAGE_AVAILABLE = True
-except ImportError:
-    _SAGE_AVAILABLE = False
-
-
 def attention(q: Tensor, k: Tensor, v: Tensor, pe: Tensor) -> Tensor:
     q, k = apply_rope(q, k, pe)
 
-    if _SAGE_AVAILABLE:
-        x = _sageattn(q, k, v, is_causal=False)
-    else:
-        x = torch.nn.functional.scaled_dot_product_attention(q, k, v)
+    x = torch.nn.functional.scaled_dot_product_attention(q, k, v)
     x = rearrange(x, "B H L D -> B L (H D)")
 
     return x
