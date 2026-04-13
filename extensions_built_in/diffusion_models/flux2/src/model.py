@@ -1092,6 +1092,7 @@ class Flux2(nn.Module):
         self.gradient_checkpointing = False
         self.selective_checkpointing = False
         self.offload_checkpoint = False
+        self.offload_checkpoint_threshold = 0
 
     @property
     def device(self):
@@ -1108,9 +1109,17 @@ class Flux2(nn.Module):
         self.gradient_checkpointing = True
         self.selective_checkpointing = True
 
-    def enable_offload_checkpoint(self):
+    def enable_offload_checkpoint(self, threshold: int = 0):
+        """Enable offloaded gradient checkpointing.
+
+        Args:
+            threshold: Only offload when img_tokens > threshold.
+                0 = always offload. E.g. 2304 for 768px means offload
+                only kicks in at resolutions above 768px.
+        """
         self.gradient_checkpointing = True
         self.offload_checkpoint = True
+        self.offload_checkpoint_threshold = threshold
 
     def forward(
         self,
@@ -1140,14 +1149,23 @@ class Flux2(nn.Module):
         pe_ctx = self.pe_embedder(ctx_ids)
 
         ckpt_kwargs = dict(use_reentrant=False)
-        if self.selective_checkpointing:
-            ckpt_kwargs["context_fn"] = _sac_context_fn
+        sac_ctx_fn = _sac_context_fn if self.selective_checkpointing else None
+        if sac_ctx_fn is not None:
+            ckpt_kwargs["context_fn"] = sac_ctx_fn
+
+        img_tokens = img.shape[1]
+        use_offload = (
+            self.offload_checkpoint
+            and (self.offload_checkpoint_threshold == 0
+                 or img_tokens > self.offload_checkpoint_threshold)
+        )
 
         for block in self.double_blocks:
-            if torch.is_grad_enabled() and self.offload_checkpoint:
+            if torch.is_grad_enabled() and use_offload:
                 img, txt = offloaded_checkpoint(
                     block, img, txt, pe_x, pe_ctx,
                     double_block_mod_img, double_block_mod_txt,
+                    sac_context_fn=sac_ctx_fn,
                 )
             elif torch.is_grad_enabled() and self.gradient_checkpointing:
                 img, txt = ckpt.checkpoint(
@@ -1174,8 +1192,11 @@ class Flux2(nn.Module):
         pe = torch.cat((pe_ctx, pe_x), dim=2)
 
         for i, block in enumerate(self.single_blocks):
-            if torch.is_grad_enabled() and self.offload_checkpoint:
-                img = offloaded_checkpoint(block, img, pe, single_block_mod)
+            if torch.is_grad_enabled() and use_offload:
+                img = offloaded_checkpoint(
+                    block, img, pe, single_block_mod,
+                    sac_context_fn=sac_ctx_fn,
+                )
             elif torch.is_grad_enabled() and self.gradient_checkpointing:
                 img = ckpt.checkpoint(
                     block,

@@ -389,6 +389,7 @@ class TrainConfig:
         self.gradient_checkpointing = kwargs.get('gradient_checkpointing', True)
         self.selective_checkpointing = kwargs.get('selective_checkpointing', False)
         self.offload_checkpoint = kwargs.get('offload_checkpoint', False)
+        self.offload_checkpoint_threshold = kwargs.get('offload_checkpoint_threshold', 0)
         self.weight_jitter = kwargs.get('weight_jitter', 0.0)
         self.merge_network_on_save = kwargs.get('merge_network_on_save', False)
         self.max_grad_norm = kwargs.get('max_grad_norm', 1.0)

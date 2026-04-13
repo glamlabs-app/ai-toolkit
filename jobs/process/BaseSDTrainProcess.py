@@ -1682,8 +1682,13 @@ class BaseSDTrainProcess(BaseTrainProcess):
         #         print_acc("sage attention is not installed. Using SDP instead")
 
         if self.train_config.offload_checkpoint and hasattr(unet, 'enable_offload_checkpoint'):
-            unet.enable_offload_checkpoint()
-            print("Offloaded gradient checkpointing enabled (async RAM)")
+            threshold = getattr(self.train_config, 'offload_checkpoint_threshold', 0)
+            unet.enable_offload_checkpoint(threshold=threshold)
+            if self.train_config.selective_checkpointing and hasattr(unet, 'selective_checkpointing'):
+                unet.selective_checkpointing = True
+            sac_str = " + SAC" if unet.selective_checkpointing else ""
+            thr_str = f", threshold={threshold}" if threshold > 0 else ""
+            print(f"Offloaded gradient checkpointing enabled (pinned async RAM{sac_str}{thr_str})")
         elif self.train_config.gradient_checkpointing:
             if self.train_config.selective_checkpointing and hasattr(unet, 'enable_selective_checkpointing'):
                 unet.enable_selective_checkpointing()
