@@ -548,15 +548,12 @@ class ToolkitNetworkMixin:
                 save_dict[key] = v
 
         if self.peft_format:
-            # lora_down = lora_A
-            # lora_up = lora_B
-            # no alpha
+            # lora_down = lora_A, lora_up = lora_B
+            # Keep alpha tensors so inference frameworks (ComfyUI) apply
+            # the correct scaling factor (alpha/rank).
 
             new_save_dict = {}
             for key, value in save_dict.items():
-                # lokr needs alpha
-                if key.endswith('.alpha') and self.network_type.lower() != "lokr":
-                    continue
                 new_key = key
                 new_key = new_key.replace('lora_down', 'lora_A')
                 new_key = new_key.replace('lora_up', 'lora_B')
