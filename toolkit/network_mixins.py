@@ -289,8 +289,13 @@ class ToolkitModuleMixin:
 
         if isinstance(x, QTensor):
             x = x.dequantize()
-        with torch.amp.autocast('cuda', dtype=torch.bfloat16):
-            lora_output = self._call_forward(x)
+        lora_dtype = getattr(network, '_lora_forward_dtype', None)
+        if lora_dtype is None or lora_dtype == torch.float32:
+            lora_input = x.to(self.lora_down.weight.dtype)
+            lora_output = self._call_forward(lora_input)
+        else:
+            with torch.amp.autocast('cuda', dtype=lora_dtype):
+                lora_output = self._call_forward(x)
         multiplier = self.network_ref().torch_multiplier
 
         lora_output_batch_size = lora_output.size(0)
@@ -463,6 +468,11 @@ class ToolkitNetworkMixin:
         self.can_merge_in = not is_lorm
         # will prevent optimizer from loading as it will have double states
         self.did_change_weights = False
+
+        _lora_dtype_str = network_config.lora_dtype if network_config else 'bf16'
+        _dtype_map = {'fp32': torch.float32, 'float32': torch.float32,
+                      'bf16': torch.bfloat16, 'bfloat16': torch.bfloat16}
+        self._lora_forward_dtype = _dtype_map.get(_lora_dtype_str, torch.bfloat16)
 
     def get_keymap(self: Network, force_weight_mapping=False):
         use_weight_mapping = False

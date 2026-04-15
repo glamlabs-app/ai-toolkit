@@ -216,6 +216,10 @@ class NetworkConfig:
         # ramtorch, doesn't work yet
         self.layer_offloading = kwargs.get('layer_offloading', False)
         
+        # dtype for LoRA forward pass and weights: "fp32" (upstream default,
+        # highest precision) or "bf16" (lower VRAM, needed for 24-32 GB GPUs).
+        self.lora_dtype = kwargs.get('lora_dtype', 'bf16')
+        
         # start from a pretrained lora
         self.pretrained_lora_path = kwargs.get('pretrained_lora_path', None)
 
