@@ -289,9 +289,8 @@ class ToolkitModuleMixin:
 
         if isinstance(x, QTensor):
             x = x.dequantize()
-        # always cast to float32
-        lora_input = x.to(self.lora_down.weight.dtype)
-        lora_output = self._call_forward(lora_input)
+        with torch.amp.autocast('cuda', dtype=torch.bfloat16):
+            lora_output = self._call_forward(x)
         multiplier = self.network_ref().torch_multiplier
 
         lora_output_batch_size = lora_output.size(0)
