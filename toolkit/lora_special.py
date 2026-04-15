@@ -302,6 +302,7 @@ class LoRASpecialNetwork(ToolkitNetworkMixin, LoRANetwork):
 
         if self.peft_format:
             # no alpha for peft
+            print(f"[LoRA] peft_format=True: overriding alpha {self.alpha} -> {self.lora_dim} (=rank), conv_alpha {self.conv_alpha} -> {self.conv_lora_dim}")
             self.alpha = self.lora_dim
             alpha = self.alpha
             self.conv_alpha = self.conv_lora_dim

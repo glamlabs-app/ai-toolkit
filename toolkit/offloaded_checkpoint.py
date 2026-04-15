@@ -78,6 +78,13 @@ class _OffloadedGradientCheckpointer(torch.autograd.Function):
         # Record when the CPU copy is done so we can sync before accessing it.
         copy_done = copy_stream.record_event()
 
+        # Snapshot RNG state so backward re-run reproduces identical dropout
+        # masks / stochastic ops (mirrors torch.utils.checkpoint behaviour).
+        ctx.fwd_cpu_state = torch.random.get_rng_state()
+        ctx.had_cuda = torch.cuda._initialized
+        if ctx.had_cuda:
+            ctx.fwd_gpu_state = torch.cuda.get_rng_state()
+
         with torch.no_grad():
             output = forward_function(hidden_states, *args)
 
@@ -111,17 +118,27 @@ class _OffloadedGradientCheckpointer(torch.autograd.Function):
         args = _detach_variable(ctx.args)
         inputs = (hidden_states,) + args
 
-        sac_ctx_fn = ctx.sac_context_fn
-        if sac_ctx_fn is not None:
-            import torch.utils.checkpoint as ckpt
-            outputs = ckpt.checkpoint(
-                ctx.forward_function, *inputs,
-                use_reentrant=False,
-                context_fn=sac_ctx_fn,
-            )
-        else:
-            with torch.enable_grad():
-                outputs = ctx.forward_function(*inputs)
+        # Restore RNG state captured during forward so any stochastic ops
+        # (e.g. dropout) produce identical masks in the re-run.
+        rng_devices = []
+        if ctx.had_cuda:
+            rng_devices = [torch.cuda.current_device()]
+        with torch.random.fork_rng(devices=rng_devices, enabled=True):
+            torch.random.set_rng_state(ctx.fwd_cpu_state)
+            if ctx.had_cuda:
+                torch.cuda.set_rng_state(ctx.fwd_gpu_state)
+
+            sac_ctx_fn = ctx.sac_context_fn
+            if sac_ctx_fn is not None:
+                import torch.utils.checkpoint as ckpt
+                outputs = ckpt.checkpoint(
+                    ctx.forward_function, *inputs,
+                    use_reentrant=False,
+                    context_fn=sac_ctx_fn,
+                )
+            else:
+                with torch.enable_grad():
+                    outputs = ctx.forward_function(*inputs)
 
         if isinstance(outputs, Tensor):
             outputs = (outputs,)
@@ -137,6 +154,91 @@ class _OffloadedGradientCheckpointer(torch.autograd.Function):
             inp.grad if isinstance(inp, Tensor) else None
             for inp in inputs
         )
+
+
+class _GpuGradientCheckpointer(torch.autograd.Function):
+    """Same logic as _OffloadedGradientCheckpointer but keeps hidden_states on GPU.
+
+    Forward:  run wrapped fn under no_grad, save only hidden_states (on GPU).
+    Backward: re-run fn from saved hidden_states under SAC context.
+
+    Memory cost: one hidden_states per block (~6MB each) vs keeping all
+    intermediate matmul outputs alive simultaneously under plain SAC.
+    No PCIe transfer at all.
+    """
+
+    @staticmethod
+    @torch.amp.custom_fwd(device_type='cuda')
+    def forward(ctx, forward_function, sac_context_fn, hidden_states, *args):
+        ctx.fwd_cpu_state = torch.random.get_rng_state()
+        ctx.had_cuda = torch.cuda._initialized
+        if ctx.had_cuda:
+            ctx.fwd_gpu_state = torch.cuda.get_rng_state()
+
+        with torch.no_grad():
+            output = forward_function(hidden_states, *args)
+
+        ctx.save_for_backward(hidden_states)
+        ctx.forward_function = forward_function
+        ctx.args = args
+        ctx.sac_context_fn = sac_context_fn
+        return output
+
+    @staticmethod
+    @torch.amp.custom_bwd(device_type='cuda')
+    def backward(ctx, *grads):
+        (hidden_states,) = ctx.saved_tensors
+        hidden_states = hidden_states.detach().requires_grad_(True)
+        args = _detach_variable(ctx.args)
+        inputs = (hidden_states,) + args
+
+        rng_devices = []
+        if ctx.had_cuda:
+            rng_devices = [torch.cuda.current_device()]
+        with torch.random.fork_rng(devices=rng_devices, enabled=True):
+            torch.random.set_rng_state(ctx.fwd_cpu_state)
+            if ctx.had_cuda:
+                torch.cuda.set_rng_state(ctx.fwd_gpu_state)
+
+            sac_ctx_fn = ctx.sac_context_fn
+            if sac_ctx_fn is not None:
+                import torch.utils.checkpoint as ckpt
+                outputs = ckpt.checkpoint(
+                    ctx.forward_function, *inputs,
+                    use_reentrant=False,
+                    context_fn=sac_ctx_fn,
+                )
+            else:
+                with torch.enable_grad():
+                    outputs = ctx.forward_function(*inputs)
+
+        if isinstance(outputs, Tensor):
+            outputs = (outputs,)
+
+        output_tensors = []
+        grad_tensors = []
+        for out, grad in zip(outputs, grads):
+            if out.requires_grad:
+                output_tensors.append(out)
+                grad_tensors.append(grad)
+        torch.autograd.backward(output_tensors, grad_tensors)
+        return (None, None) + tuple(
+            inp.grad if isinstance(inp, Tensor) else None
+            for inp in inputs
+        )
+
+
+@torch._disable_dynamo
+def gpu_checkpoint(function, *args, sac_context_fn=None):
+    """Like offloaded_checkpoint but keeps hidden_states on GPU (no PCIe transfer).
+
+    Forward runs under no_grad saving only the block input tensor.
+    Backward re-runs per-block under SAC so matmul outputs are only live one
+    block at a time, not accumulated across all blocks simultaneously.
+    """
+    if len(args) > 0 and isinstance(args[0], Tensor) and not args[0].requires_grad:
+        args = (args[0].detach().requires_grad_(),) + args[1:]
+    return _GpuGradientCheckpointer.apply(function, sac_context_fn, *args)
 
 
 @torch._disable_dynamo
