@@ -301,9 +301,10 @@ class LoRASpecialNetwork(ToolkitNetworkMixin, LoRANetwork):
                 self.peft_format = True
 
         if self.peft_format:
-            # no alpha for peft
-            self.alpha = self.lora_dim
-            alpha = self.alpha
+            # PEFT handles scaling internally so we don't need alpha for the
+            # forward pass, but we preserve the configured alpha value so it
+            # gets saved into the safetensors file and ComfyUI can compute the
+            # correct scale = alpha/rank at inference.
             self.conv_alpha = self.conv_lora_dim
             conv_alpha = self.conv_alpha
 
