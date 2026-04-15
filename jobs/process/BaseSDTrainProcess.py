@@ -1621,22 +1621,6 @@ class BaseSDTrainProcess(BaseTrainProcess):
         # compile the model if needed
         if self.model_config.compile:
             try:
-                # FP4 linear layers use custom CUDA ops that dynamo can't trace —
-                # disable tracing on the whole class before compiling.
-                try:
-                    from fouroversix.model.modules.linear import FourOverSixLinear
-                    FourOverSixLinear.forward = torch._dynamo.disable(FourOverSixLinear.forward)
-                except ImportError:
-                    pass
-
-                # RoPE (apply_rotary_emb) uses complex-number ops that cause
-                # inductor shape assertion errors — disable in transformer_flux namespace.
-                try:
-                    import diffusers.models.transformers.transformer_flux as _tf
-                    _tf.apply_rotary_emb = torch._dynamo.disable(_tf.apply_rotary_emb)
-                except (ImportError, AttributeError):
-                    pass
-
                 self.sd.unet = torch.compile(self.sd.unet, dynamic=True)
             except Exception as e:
                 print_acc(f"Failed to compile model: {e}")

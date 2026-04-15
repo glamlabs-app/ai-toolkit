@@ -952,6 +952,7 @@ class FourOverSixScaledLinear(nn.Module):
             self._qt_scale_rule, self._qt_padded_shape,
         )
 
+    @torch._dynamo.disable
     def forward(self, x: Tensor) -> Tensor:
         leading = x.shape[:-1]
         x2d = x.reshape(-1, x.shape[-1]).contiguous()
@@ -1535,6 +1536,7 @@ def attention(q: Tensor, k: Tensor, v: Tensor, pe: Tensor) -> Tensor:
     return x
 
 
+@torch._dynamo.disable
 def rope(pos: Tensor, dim: int, theta: int) -> Tensor:
     assert dim % 2 == 0
     scale = torch.arange(0, dim, 2, dtype=pos.dtype, device=pos.device) / dim
@@ -1547,6 +1549,7 @@ def rope(pos: Tensor, dim: int, theta: int) -> Tensor:
     return out.float()
 
 
+@torch._dynamo.disable
 def apply_rope(xq: Tensor, xk: Tensor, freqs_cis: Tensor) -> tuple[Tensor, Tensor]:
     xq_ = xq.float().reshape(*xq.shape[:-1], -1, 1, 2)
     xk_ = xk.float().reshape(*xk.shape[:-1], -1, 1, 2)
