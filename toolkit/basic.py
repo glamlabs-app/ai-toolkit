@@ -9,11 +9,7 @@ def value_map(inputs, min_in, max_in, min_out, max_out):
 
 
 def flush(garbage_collect=True):
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-    # if is mps, also clear the mps cache
-    if torch.backends.mps.is_available():
-        torch.mps.empty_cache()
+    torch.cuda.empty_cache()
     if garbage_collect:
         gc.collect()
 

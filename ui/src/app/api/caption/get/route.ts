@@ -5,18 +5,8 @@ import path from 'path';
 import { getDatasetsRoot } from '@/server/settings';
 
 export async function POST(request: NextRequest) {
-  let body;
-  try {
-    body = await request.json();
-  } catch {
-    // Client aborted the request before body was fully sent
-    return new NextResponse(null, { status: 499 });
-  }
-
-  if (request.signal.aborted) {
-    return new NextResponse(null, { status: 499 });
-  }
-
+  
+  const body = await request.json();
   const { imgPath } = body;
   console.log('Received POST request for caption:', imgPath);
   try {

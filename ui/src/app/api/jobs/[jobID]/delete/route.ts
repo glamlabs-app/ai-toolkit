@@ -21,7 +21,7 @@ export async function GET(request: NextRequest, { params }: { params: { jobID: s
   const trainingFolder = path.join(trainingRoot, job.name);
 
   if (fs.existsSync(trainingFolder)) {
-    fs.rmSync(trainingFolder, { recursive: true, force: true });
+    fs.rmdirSync(trainingFolder, { recursive: true });
   }
 
   await prisma.job.delete({

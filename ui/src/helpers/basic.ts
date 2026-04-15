@@ -1,1 +1,0 @@
-export const isMac = () => (typeof window !== 'undefined' && (window as any).server_platform === 'darwin') || process.platform === 'darwin';

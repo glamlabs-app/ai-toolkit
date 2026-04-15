@@ -6,7 +6,6 @@ import Editor, { OnMount } from '@monaco-editor/react';
 import type { editor } from 'monaco-editor';
 import { Settings } from '@/hooks/useSettings';
 import { migrateJobConfig } from './jobConfig';
-import { useTheme } from '@/components/ThemeProvider';
 
 type Props = {
   jobConfig: JobConfig;
@@ -36,7 +35,6 @@ const yamlConfig: YAML.DocumentOptions &
 };
 
 export default function AdvancedJob({ jobConfig, setJobConfig, settings }: Props) {
-  const { theme } = useTheme();
   const [editorValue, setEditorValue] = useState<string>('');
   const lastJobConfigUpdateStringRef = useRef('');
   const editorRef = useRef<editor.IStandaloneCodeEditor | null>(null);
@@ -134,7 +132,7 @@ export default function AdvancedJob({ jobConfig, setJobConfig, settings }: Props
         width="100%"
         defaultLanguage="yaml"
         value={editorValue}
-        theme={theme === 'dark' ? 'vs-dark' : 'light'}
+        theme="vs-dark"
         onChange={handleChange}
         onMount={handleEditorDidMount}
         options={{

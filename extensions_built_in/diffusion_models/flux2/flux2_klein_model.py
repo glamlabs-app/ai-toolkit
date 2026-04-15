@@ -34,14 +34,29 @@ class Flux2KleinModel(Flux2Model):
         # use the new format on this new model by default
         self.use_old_lokr_format = False
 
+    def _resolve_te_path(self):
+        import os
+        local_te = os.path.join(self.model_config.name_or_path, "text_encoder")
+        if os.path.isdir(local_te):
+            return local_te
+        return self.flux2_klein_te_path
+
+    def _resolve_tokenizer_path(self):
+        import os
+        local_tok = os.path.join(self.model_config.name_or_path, "tokenizer")
+        if os.path.isdir(local_tok):
+            return local_tok
+        return self._resolve_te_path()
+
     def load_te(self):
         if self.flux2_klein_te_path is None:
             raise ValueError("flux2_klein_te_path must be set for Flux2KleinModel")
+        te_path = self._resolve_te_path()
         dtype = self.torch_dtype
-        self.print_and_status_update("Loading Qwen3")
+        self.print_and_status_update(f"Loading Qwen3 from {te_path}")
 
         text_encoder: Qwen3ForCausalLM = Qwen3ForCausalLM.from_pretrained(
-            self.flux2_klein_te_path,
+            te_path,
             torch_dtype=dtype,
         )
         text_encoder.to(self.device_torch, dtype=dtype)
@@ -64,7 +79,7 @@ class Flux2KleinModel(Flux2Model):
                 offload_percent=self.model_config.layer_offloading_text_encoder_percent,
             )
 
-        tokenizer = Qwen2Tokenizer.from_pretrained(self.flux2_klein_te_path)
+        tokenizer = Qwen2Tokenizer.from_pretrained(self._resolve_tokenizer_path())
         return text_encoder, tokenizer
 
 

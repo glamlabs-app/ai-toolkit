@@ -28,19 +28,18 @@ const DatasetImageCard: React.FC<DatasetImageCardProps> = ({
   const [isCaptionLoaded, setIsCaptionLoaded] = useState<boolean>(false);
   const [caption, setCaption] = useState<string>('');
   const [savedCaption, setSavedCaption] = useState<string>('');
-  const abortControllerRef = useRef<AbortController | null>(null);
+  const isGettingCaption = useRef<boolean>(false);
 
   const fetchCaption = async () => {
-    if (isCaptionLoaded) return;
-    abortControllerRef.current?.abort();
-    const controller = new AbortController();
-    abortControllerRef.current = controller;
+    if (isGettingCaption.current || isCaptionLoaded) return;
+    isGettingCaption.current = true;
     apiClient
-      .post(`/api/caption/get`, { imgPath: imageUrl }, { signal: controller.signal })
+      .post(`/api/caption/get`, { imgPath: imageUrl })
       .then(res => res.data)
       .then(data => {
         console.log('Caption fetched:', data);
         if (data) {
+          // fix issue where caption could be non string
           data = `${data}`;
         }
         setCaption(data || '');
@@ -48,13 +47,10 @@ const DatasetImageCard: React.FC<DatasetImageCardProps> = ({
         setIsCaptionLoaded(true);
       })
       .catch(error => {
-        if (controller.signal.aborted) return;
         console.error('Error fetching caption:', error);
       })
       .finally(() => {
-        if (abortControllerRef.current === controller) {
-          abortControllerRef.current = null;
-        }
+        isGettingCaption.current = false;
       });
   };
 
@@ -92,8 +88,6 @@ const DatasetImageCard: React.FC<DatasetImageCardProps> = ({
           }
         } else {
           setInViewport(false);
-          // Cancel any in-flight caption fetch when scrolling away
-          abortControllerRef.current?.abort();
         }
       },
       { threshold: 0.1 },
@@ -205,6 +199,11 @@ const DatasetImageCard: React.FC<DatasetImageCardProps> = ({
             </button>
           </div>
         </div>
+        {inViewport && isVisible && !isItAudio && (
+          <div className="text-xs text-gray-100 bg-gray-950 mt-1 absolute bottom-0 left-0 p-1 opacity-25 hover:opacity-90 transition-opacity duration-300 w-full">
+            {imageUrl}
+          </div>
+        )}
       </div>
       <div
         className={classNames('w-full p-2 bg-gray-800 text-white text-sm rounded-b-lg h-[75px]', {

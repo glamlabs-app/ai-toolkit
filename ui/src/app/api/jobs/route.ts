@@ -1,6 +1,5 @@
 import { NextResponse } from 'next/server';
 import { PrismaClient } from '@prisma/client';
-import { isMac } from '@/helpers/basic';
 
 const prisma = new PrismaClient();
 
@@ -29,12 +28,7 @@ export async function GET(request: Request) {
 export async function POST(request: Request) {
   try {
     const body = await request.json();
-    const { id, name, job_config } = body;
-    let gpu_ids: string = body.gpu_ids;
-
-    if (isMac()) {
-      gpu_ids = "mps";
-    }
+    const { id, name, job_config, gpu_ids } = body;
 
     if (id) {
       // Update existing training

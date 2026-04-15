@@ -16,9 +16,9 @@ export async function POST(request: Request) {
     }
 
     // delete it and return success
-    fs.rmSync(datasetPath, { recursive: true, force: true });
+    fs.rmdirSync(datasetPath, { recursive: true });
     return NextResponse.json({ success: true });
   } catch (error) {
-    return NextResponse.json({ error: 'Failed to delete dataset' }, { status: 500 });
+    return NextResponse.json({ error: 'Failed to create dataset' }, { status: 500 });
   }
 }

@@ -64,7 +64,8 @@ export default function useJobLossLog(jobID: string, reloadInterval: null | numb
           params.since_step = lastStepByKeyRef.current[k];
         }
 
-        params.limit = 1000000;
+        // keep default limit from server (or set explicitly if you want)
+        // params.limit = 2000;
 
         return apiClient
           .get(`/api/jobs/${jobID}/loss`, { params })

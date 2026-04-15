@@ -17,7 +17,6 @@ export async function GET(request: NextRequest, { params }: { params: { jobID: s
       stop: true,
       status: 'stopped',
       info: 'Job stopped',
-      pid: null,
     },
   });
 

@@ -35,6 +35,23 @@ def get_lr_scheduler(
         return torch.optim.lr_scheduler.LinearLR(
             optimizer, **kwargs
         )
+    elif name == 'cosine_with_warmup':
+        import math
+        num_warmup = kwargs.pop('num_warmup_steps', 100)
+        total = kwargs.pop('total_iters', None)
+        eta_min = kwargs.pop('eta_min', 0.0)
+        if total is None:
+            raise ValueError("cosine_with_warmup requires total_iters in lr_scheduler_params")
+        base_lr = optimizer.defaults['lr']
+        min_ratio = eta_min / base_lr if base_lr > 0 else 0.0
+
+        def lr_lambda(step):
+            if step < num_warmup:
+                return max(1e-3, step / max(1, num_warmup))
+            progress = (step - num_warmup) / max(1, total - num_warmup)
+            return min_ratio + (1.0 - min_ratio) * 0.5 * (1.0 + math.cos(math.pi * progress))
+
+        return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
     elif name == 'constant_with_warmup':
         # see if num_warmup_steps is in kwargs
         if 'num_warmup_steps' not in kwargs:

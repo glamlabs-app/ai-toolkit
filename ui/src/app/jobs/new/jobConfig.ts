@@ -1,5 +1,3 @@
-'use client';
-import { isMac } from '@/helpers/basic';
 import { JobConfig, DatasetConfig, SliderConfig } from '@/types';
 
 export const defaultDatasetConfig: DatasetConfig = {
@@ -201,9 +199,5 @@ export const migrateJobConfig = (jobConfig: JobConfig): JobConfig => {
       use_ui_logger: true,
     };
   }
-  if (isMac()) {
-    jobConfig.config.process[0].device = 'mps';
-  }
-
   return jobConfig;
 };

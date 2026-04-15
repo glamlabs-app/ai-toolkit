@@ -51,7 +51,6 @@ export interface CpuInfo {
 
 export interface GPUApiResponse {
   hasNvidiaSmi: boolean;
-  isMac: boolean;
   gpus: GpuInfo[];
   error?: string;
 }
@@ -108,7 +107,6 @@ export interface DatasetConfig {
   control_path_1?: string | null;
   control_path_2?: string | null;
   control_path_3?: string | null;
-  auto_frame_count?: boolean;
 }
 
 export interface EMAConfig {
